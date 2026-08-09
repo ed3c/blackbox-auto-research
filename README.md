@@ -16,6 +16,8 @@ The v0.2 Python kernel adds:
 - paired repeated-trial decisions with hard-guardrail precedence;
 - deterministic fake target tests for reset isolation.
 
+The typed v2 contracts do not replace `autoresearch-ledger/v1`. Ledger v1 remains the lightweight skill-facing experiment format and is still validated by `scripts/check_experiment_ledger.py`; v2 manifests and evidence records are the trusted runtime layer used when artifact identity, replay, stochastic evaluation, or promotion provenance matters.
+
 See [architecture and domain adapters](docs/ARCHITECTURE.md).
 
 ## Installable skills

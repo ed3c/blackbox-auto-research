@@ -24,6 +24,14 @@ class DecisionKind(str, Enum):
     QUARANTINE = "quarantine"
 
 
+class PromotionStage(str, Enum):
+    OFFLINE = "offline"
+    SHADOW = "shadow"
+    CANARY = "canary"
+    PRODUCTION = "production"
+    ROLLBACK = "rollback"
+
+
 def _require_digest(name: str, value: str) -> None:
     if not _DIGEST_RE.fullmatch(value):
         raise ValueError(f"{name} must be sha256:<64 lowercase hex chars>")
@@ -39,6 +47,8 @@ class TaskSpec:
     def __post_init__(self) -> None:
         if not self.task_id.strip() or not self.objective.strip():
             raise ValueError("task_id and objective must be non-empty")
+        if not isinstance(self.evidence_mode, EvidenceMode):
+            raise ValueError("evidence_mode must be a valid EvidenceMode")
         _require_digest("task.digest", self.digest)
 
 
@@ -132,3 +142,23 @@ class Evaluation:
             raise ValueError("evaluation requires independent evidence")
         for digest in self.evidence_digests:
             _require_digest("evaluation.evidence_digest", digest)
+
+
+@dataclass(frozen=True)
+class PromotionReceipt:
+    candidate_digest: str
+    stage: PromotionStage
+    evaluator_digest: str
+    environment_digest: str
+    approved: bool
+    approval_actor: str | None = None
+    rollback_of: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_digest("promotion.candidate_digest", self.candidate_digest)
+        _require_digest("promotion.evaluator_digest", self.evaluator_digest)
+        _require_digest("promotion.environment_digest", self.environment_digest)
+        if self.stage is PromotionStage.PRODUCTION and self.approved and not self.approval_actor:
+            raise ValueError("production approval requires an approval_actor")
+        if self.rollback_of is not None:
+            _require_digest("promotion.rollback_of", self.rollback_of)
