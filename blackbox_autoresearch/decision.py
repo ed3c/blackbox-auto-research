@@ -39,7 +39,14 @@ def decide_paired_trials(
     """
 
     if quarantine or not hard_guardrails_passed:
-        return TrialDecision(DecisionKind.QUARANTINE, 0.0, 0.0, 0, "hard guardrail or safety anomaly")
+        return TrialDecision(
+            DecisionKind.QUARANTINE,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            "hard guardrail or safety anomaly",
+        )
     if direction not in {"maximize", "minimize"}:
         raise ValueError("direction must be maximize or minimize")
     if len(baseline) != len(candidate) or len(baseline) < 2:
