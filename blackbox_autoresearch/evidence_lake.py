@@ -13,7 +13,7 @@ import hmac
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Protocol
+from typing import Any, Protocol, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class HMACSigner:
 
 
 class DirectoryBlobStore:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: Union[str, Path]) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +85,7 @@ class DirectoryBlobStore:
 class SQLiteEvidenceIndex:
     GENESIS = "sha256:" + "0" * 64
 
-    def __init__(self, path: str | Path, signer: ProvenanceSigner) -> None:
+    def __init__(self, path: Union[str, Path], signer: ProvenanceSigner) -> None:
         self.path = Path(path)
         self.signer = signer
         with self._connect() as db:
@@ -203,9 +203,9 @@ class SQLiteEvidenceIndex:
     def find_runs(
         self,
         *,
-        candidate_digest: str | None = None,
-        evaluator_digest: str | None = None,
-        environment_digest: str | None = None,
+        candidate_digest: Optional[str] = None,
+        evaluator_digest: Optional[str] = None,
+        environment_digest: Optional[str] = None,
     ) -> tuple[str, ...]:
         clauses: list[str] = []
         values: list[str] = []
