@@ -1,0 +1,25 @@
+{
+  "schema": "autoresearch-ledger/v1",
+  "goal": "Reduce deterministic evaluation latency.",
+  "metric": {"name": "seconds", "direction": "minimize", "baseline": 10.0},
+  "guardrails": ["all behavior tests pass"],
+  "stop_loss": {"max_iterations": 5, "max_no_progress": 2},
+  "iterations": [
+    {
+      "hypothesis": "Avoiding duplicate parsing will reduce latency.",
+      "change": "Cache one parsed immutable input.",
+      "verify": "bash verify.sh",
+      "result": 8.5,
+      "decision": "keep",
+      "failure_signature": "none"
+    },
+    {
+      "hypothesis": "Parallelizing a tiny step may reduce latency.",
+      "change": "Run two small checks concurrently.",
+      "verify": "bash verify.sh",
+      "result": 8.7,
+      "decision": "discard",
+      "failure_signature": "overhead exceeded saved time"
+    }
+  ]
+}
