@@ -1,0 +1,23 @@
+{
+  "schema": "autoresearch-ledger/v1",
+  "metric": {"name": "score", "direction": "maximize", "baseline": 0.5},
+  "stop_loss": {"max_iterations": 3, "max_no_progress": 2},
+  "iterations": [
+    {
+      "hypothesis": "A bounded change improves the score.",
+      "change": "Change one parameter.",
+      "verify": "run evaluator",
+      "result": 0.7,
+      "decision": "keep",
+      "failure_signature": "none"
+    },
+    {
+      "hypothesis": "A second change may help.",
+      "change": "Change a different parameter.",
+      "verify": "run evaluator",
+      "result": 0.6,
+      "decision": "discard",
+      "failure_signature": "score regressed"
+    }
+  ]
+}

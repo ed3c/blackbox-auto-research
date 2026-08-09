@@ -1,0 +1,23 @@
+{
+  "schema": "autoresearch-ledger/v1",
+  "metric": {"name": "score", "direction": "maximize", "baseline": 0.5},
+  "stop_loss": {"max_iterations": 1, "max_no_progress": 1},
+  "iterations": [
+    {
+      "hypothesis": "",
+      "change": "Change everything.",
+      "verify": "",
+      "result": 0.4,
+      "decision": "keep",
+      "failure_signature": ""
+    },
+    {
+      "hypothesis": "Try again.",
+      "change": "Repeat.",
+      "verify": "none",
+      "result": 0.3,
+      "decision": "discard",
+      "failure_signature": "same failure"
+    }
+  ]
+}
