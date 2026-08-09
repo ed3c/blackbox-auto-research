@@ -6,19 +6,32 @@ The repository provides a domain-agnostic experiment control plane: define a fal
 
 ## Trust kernel
 
-The v0.2 Python kernel adds:
+The v0.x line provides:
 
 - immutable task, candidate and run manifests with SHA-256 artifact identities;
 - explicit `BLACK`, `GRAY`, and `WHITE` evidence modes;
-- separate `EnvironmentAdapter` and `Verifier` interfaces;
-- verifier qualification against golden, initial and planted-bad states;
-- tamper-evident hash-chained evidence events;
-- paired repeated-trial decisions with hard-guardrail precedence;
-- deterministic fake target tests for reset isolation.
+- separate execution and verifier interfaces;
+- verifier qualification and hidden-case separation;
+- content-addressed, tamper-evident evidence primitives;
+- paired stochastic decisions and pluggable search primitives;
+- provider/domain adapters for OpenShell, Enroot, NeMo Gym, mobile and non-UI workloads;
+- staged promotion contracts.
 
-The typed v2 contracts do not replace `autoresearch-ledger/v1`. Ledger v1 remains the lightweight skill-facing experiment format and is still validated by `scripts/check_experiment_ledger.py`; v2 manifests and evidence records are the trusted runtime layer used when artifact identity, replay, stochastic evaluation, or promotion provenance matters.
+These are **reference contracts and implementations**. Adapter existence is not evidence that an external provider, device or production deployment has been validated.
 
-See [architecture and domain adapters](docs/ARCHITECTURE.md).
+The typed v2 contracts do not replace `autoresearch-ledger/v1`. Ledger v1 remains the lightweight skill-facing experiment format; v2 manifests/evidence are the trusted runtime layer when identity, replay, stochastic evaluation or promotion provenance matters.
+
+## Agent and v1.0 entrypoints
+
+Agents should start with [AGENTS.md](AGENTS.md), then read:
+
+- [architecture](docs/ARCHITECTURE.md)
+- [v1.0 integration roadmap](docs/INTEGRATION_ROADMAP.md)
+- [runtime validation maturity contract](docs/RUNTIME_VALIDATION.md)
+- [evidence contract](docs/EVIDENCE_CONTRACT.md)
+- [integration-specific contracts](docs/integrations/)
+
+The v1.0 goal is to move selected integrations from `L1 REFERENCE` / `L2 SANDBOX` to evidence-backed `L3 LIVE` and `L4 PRODUCTION`. Open issues #19-#29 track that work.
 
 ## Installable skills
 
@@ -32,16 +45,8 @@ See [architecture and domain adapters](docs/ARCHITECTURE.md).
 bash verify.sh
 ```
 
-## Delivery
+## Delivery history
 
-- PRD: [#1](https://github.com/ed3c/blackbox-auto-research/issues/1)
-- trusted contracts: [#4](https://github.com/ed3c/blackbox-auto-research/issues/4)
-- adapter SDK: [#5](https://github.com/ed3c/blackbox-auto-research/issues/5)
-- runtime isolation: [#6](https://github.com/ed3c/blackbox-auto-research/issues/6)
-- verifier qualification: [#7](https://github.com/ed3c/blackbox-auto-research/issues/7)
-- evidence replay: [#8](https://github.com/ed3c/blackbox-auto-research/issues/8)
-- stochastic decisions and search: [#9](https://github.com/ed3c/blackbox-auto-research/issues/9), [#10](https://github.com/ed3c/blackbox-auto-research/issues/10)
-- provider and domain bridges: [#11](https://github.com/ed3c/blackbox-auto-research/issues/11), [#12](https://github.com/ed3c/blackbox-auto-research/issues/12), [#13](https://github.com/ed3c/blackbox-auto-research/issues/13)
-- staged promotion: [#14](https://github.com/ed3c/blackbox-auto-research/issues/14)
+v0.x contracts and reference implementations are tracked by closed issues #1 and #4-#14. Live/production validation is tracked by open issues #19-#29 and `docs/INTEGRATION_ROADMAP.md`.
 
 License: MIT.
