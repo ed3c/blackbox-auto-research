@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -74,6 +76,89 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceVerificationError, "repository_bundle_digest mismatch"):
             self.verify(bundle)
 
+    def test_candidate_bytes_cannot_claim_a_different_identity(self) -> None:
+        bundle = self.produce()
+        (bundle / "candidate.py").write_text("print('forged')\n")
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["candidate_digest"] = (
+            "sha256:" + hashlib.sha256((bundle / "candidate.py").read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "candidate identity"):
+            self.verify(bundle)
+
+    def test_runtime_fingerprint_drift_fails_closed(self) -> None:
+        bundle = self.produce()
+        manifest_path = bundle / "manifest.json"
+        outcome_path = bundle / "outcome.json"
+        manifest = json.loads(manifest_path.read_text())
+        outcome = json.loads(outcome_path.read_text())
+        manifest["environment"]["git_version"] = "git version forged"
+        outcome["git_version"] = "git version forged"
+        outcome_path.write_text(json.dumps(outcome, sort_keys=True, separators=(",", ":")) + "\n")
+        manifest["evidence"]["outcome_digest"] = (
+            "sha256:" + hashlib.sha256(outcome_path.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "identity drift"):
+            self.verify(bundle)
+
+    def test_untrusted_test_change_is_rejected_before_execution(self) -> None:
+        bundle = self.produce()
+        marker = self.root / "untrusted-test-executed"
+        with tempfile.TemporaryDirectory() as temporary:
+            clone = Path(temporary) / "repository"
+            subprocess.run(
+                ["git", "clone", "--quiet", str(bundle / "repository.bundle"), str(clone)],
+                check=True,
+            )
+            (clone / "test_calculator.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+            )
+            subprocess.run(["git", "add", "test_calculator.py"], cwd=clone, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Forger", "-c", "user.email=forger@example.invalid",
+                 "commit", "--amend", "--no-edit"],
+                cwd=clone, check=True, capture_output=True, text=True,
+            )
+            final_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=clone, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            (bundle / "repository.bundle").unlink()
+            subprocess.run(
+                ["git", "bundle", "create", str(bundle / "repository.bundle"), "--all"],
+                cwd=clone, check=True,
+            )
+        outcome_path = bundle / "outcome.json"
+        outcome = json.loads(outcome_path.read_text())
+        outcome["final_head"] = final_head
+        outcome_path.write_text(json.dumps(outcome, sort_keys=True, separators=(",", ":")) + "\n")
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["outcome_digest"] = "sha256:" + hashlib.sha256(outcome_path.read_bytes()).hexdigest()
+        manifest["evidence"]["repository_bundle_digest"] = (
+            "sha256:" + hashlib.sha256((bundle / "repository.bundle").read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "test source mismatch"):
+            self.verify(bundle)
+        self.assertFalse(marker.exists())
+
+    def test_manifest_extra_key_fails_closed(self) -> None:
+        bundle = self.produce()
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["untrusted"] = True
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "manifest keys drift"):
+            self.verify(bundle)
+
     def test_context_drift_fails_closed(self) -> None:
         bundle = self.produce()
         drifted = EvidenceContext(**{**self.context.__dict__, "run_id": "999"})
@@ -126,12 +211,21 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
 
     def test_workflow_uses_separate_jobs_and_runner_temp_workspace(self) -> None:
         workflow = (ROOT / ".github/workflows/live-git-workspace-evidence.yml").read_text()
+        artifact_actions = re.findall(
+            r"(?m)^\s*uses:\s+(actions/(?:upload|download)-artifact@\S+)", workflow
+        )
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("verify:\n    needs: produce", workflow)
         self.assertIn('--workspace "$RUNNER_TEMP/blackbox-disposable-repository"', workflow)
         self.assertIn("--tamper-probe", workflow)
-        self.assertEqual(workflow.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"), 2)
-        self.assertEqual(workflow.count("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"), 1)
+        self.assertEqual(
+            artifact_actions,
+            [
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            ],
+        )
 
 
 if __name__ == "__main__":
