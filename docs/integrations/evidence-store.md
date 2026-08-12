@@ -3,26 +3,34 @@
 Issue: #25
 
 ```yaml
-current_maturity: L2_SANDBOX
+current_maturity: L2_PLUS
 target_maturity: L4_PRODUCTION
 ```
 
-## Agent task
+## Proven in repository/CI
 
-Replace worker-local filesystem durability as the production boundary with provider-neutral blob + metadata interfaces and at least one production-grade deployment implementation.
+- provider-neutral `BlobStore` and `ProvenanceSigner` protocols;
+- immutable content-addressed directory blob backend;
+- SQLite metadata/index backend with WAL and `BEGIN IMMEDIATE` serialized append;
+- signed per-run event chains;
+- fresh-process reopen and provenance verification;
+- candidate/evaluator/environment lookup;
+- tamper and wrong-signing-key rejection.
 
-## Required properties
+These are production-shaped reference primitives. `HMACSigner` is explicitly a test/reference signer and does not substitute for KMS/HSM provenance.
 
-- immutable content-addressed blobs;
-- indexed run/candidate/evaluator/environment metadata;
-- concurrency-safe append/event semantics;
-- signing/KMS or equivalent provenance;
-- encryption and least privilege;
-- retention/deletion policy;
-- failed/discarded/quarantined queryability;
-- backup/restore and corruption recovery;
-- evaluator/environment drift queries.
+## Remaining production requirements
+
+- [ ] external object/blob store implementation;
+- [ ] production metadata/index service suitable for multi-host writers;
+- [ ] KMS/HSM or equivalent managed signing;
+- [ ] encryption and least-privilege IAM validation;
+- [ ] retention/deletion policy implementation;
+- [ ] failed/discarded/quarantined operational queries;
+- [ ] backup/restore and corruption recovery against the external stores;
+- [ ] multi-host concurrency/recovery test;
+- [ ] fresh verifier on another worker retrieves evidence and reproduces the decision.
 
 ## Done
 
-A fresh verifier process with no access to the original worker filesystem can retrieve evidence, validate provenance and reproduce the recorded decision.
+#25 closes only when a fresh verifier process on an independent worker can retrieve external evidence, validate managed provenance and reproduce the recorded decision. SQLite/directory tests alone must not close the issue.

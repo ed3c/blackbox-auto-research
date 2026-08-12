@@ -43,12 +43,14 @@ A closed v0.x issue does not imply a live integration is production-ready.
 | #21 | Enroot GPU/HPC | L1 | L3 | `integrations/enroot.md` |
 | #22 | iOS + Android | L1 | L3 | `integrations/mobile.md` |
 | #23 | distributed/device workers | L1 | L3 | `integrations/distributed-workers.md` |
-| #24 | Terminal/MCP/API/Data/CI | L1 | L3 | `integrations/domain-workloads.md` |
-| #25 | evidence lake | L2 | L4 | `integrations/evidence-store.md` |
+| #24 | Terminal/MCP/API/Data/CI | L2 | L3 | `integrations/domain-workloads.md` |
+| #25 | evidence lake | L2+ | L4 | `integrations/evidence-store.md` |
 | #26 | security | L2 | L4 | `integrations/security.md` |
 | #27 | observability/SRE | L1 | L4 | `integrations/observability.md` |
 | #28 | production promotion | L2 | L4 | `integrations/production-promotion.md` |
 | #29 | release engineering | L1 | L4 | `integrations/release.md` |
+
+`L2+` means production-shaped provider-neutral primitives have been added and tested, but the target external object store/KMS/multi-host deployment required for L4 is still unproven.
 
 ## Priority
 
