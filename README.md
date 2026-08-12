@@ -47,6 +47,6 @@ bash verify.sh
 
 ## Delivery history
 
-v0.x contracts and reference implementations are tracked by closed issues #1 and #4-#14. Live/production validation is tracked by open issues #19-#29 and `docs/INTEGRATION_ROADMAP.md`.
+v0.x contracts and reference implementations are tracked by closed issues #1 and #4-#14. Live/production validation is tracked by issues #19-#29 and `docs/INTEGRATION_ROADMAP.md`.
 
 License: MIT.

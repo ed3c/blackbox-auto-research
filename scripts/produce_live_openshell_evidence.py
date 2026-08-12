@@ -16,7 +16,7 @@ from blackbox_autoresearch.openshell_live_evidence import (  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description="Produce partial live OpenShell evidence")
+    value = argparse.ArgumentParser(description="Produce replayable live OpenShell evidence")
     value.add_argument("--output", type=Path, required=True)
     value.add_argument("--run-id", required=True)
     value.add_argument("--sandbox-name", required=True)

@@ -1,8 +1,8 @@
-"""Replayable partial-live evidence from a real OpenShell sandbox.
+"""Replayable L3 evidence from a real OpenShell sandbox.
 
-This module deliberately does not claim that issue #19 reached L3.  It captures
-the probes that can be executed without credentials or evaluator secrets and
-records the remaining guarantees as unproven.
+The harness uses a synthetic one-run credential canary, persists only its digest,
+and records the required candidate-side OpenShell policy, evaluator and teardown
+boundaries for independent verification outside the candidate process.
 """
 
 from __future__ import annotations
@@ -25,12 +25,15 @@ from .ci_live_evidence import EvidenceVerificationError
 from .contracts import CandidateRef, EvidenceMode, RunManifest, TaskSpec
 
 
-EVIDENCE_SCHEMA = "blackbox-openshell-evidence/v4"
-TRAJECTORY_SCHEMA = "blackbox-openshell-trajectory/v4"
-OUTCOME_SCHEMA = "blackbox-openshell-outcome/v4"
-VERIFICATION_SCHEMA = "blackbox-openshell-verification/v4"
+EVIDENCE_SCHEMA = "blackbox-openshell-evidence/v5"
+TRAJECTORY_SCHEMA = "blackbox-openshell-trajectory/v5"
+OUTCOME_SCHEMA = "blackbox-openshell-outcome/v5"
+VERIFICATION_SCHEMA = "blackbox-openshell-verification/v5"
 CURRENT_MATURITY = "L1 REFERENCE"
+TARGET_MATURITY = "L3 LIVE"
 EVALUATOR_SANDBOX_PATH = "/evaluator/canary.txt"
+ALLOWED_CREDENTIAL_NAME = "BBX_ALLOWED_SENTINEL"
+DENIED_CREDENTIAL_NAME = "BBX_DENIED_SENTINEL"
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^openshell ([0-9]+\.[0-9]+\.[0-9]+)$")
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
@@ -150,7 +153,7 @@ def _policy_spec(config: OpenShellRunConfig) -> dict[str, object]:
         "allowed_endpoint": f"{host}:443:read-only:rest:enforce",
         "allowed_rule": f"{host}:443:GET:/**",
         "binary": "/usr/bin/curl",
-        "credentials": [],
+        "credentials": [ALLOWED_CREDENTIAL_NAME],
         "evaluator_path": EVALUATOR_SANDBOX_PATH,
         "evaluator_initial_access": "absent",
         "evaluator_unlock": "read_only",
@@ -161,6 +164,40 @@ def _policy_spec(config: OpenShellRunConfig) -> dict[str, object]:
 def _temporary_base_tag(config: OpenShellRunConfig) -> str:
     suffix = hashlib.sha256(config.run_id.encode()).hexdigest()[:16]
     return f"blackbox-openshell-base:{suffix}"
+
+
+def _credential_provider_name(config: OpenShellRunConfig) -> str:
+    suffix = hashlib.sha256(config.run_id.encode()).hexdigest()[:16]
+    return f"bbx-openshell-provider-{suffix}"
+
+
+def _redacted_provider_create_event(
+    result: CommandResult,
+    *,
+    credential_canary: str,
+    credential_canary_digest: str,
+) -> dict[str, object]:
+    if credential_canary in result.stdout or credential_canary in result.stderr:
+        raise RuntimeError("provider create exposed the credential canary")
+    argv = list(result.argv)
+    argv[-1] = f"{ALLOWED_CREDENTIAL_NAME}=<redacted:{credential_canary_digest}>"
+    return {
+        "name": "provider-create", "argv": argv, "returncode": result.returncode,
+        "stdout": result.stdout, "stderr": result.stderr,
+    }
+
+
+def _redacted_placeholder_event(
+    result: CommandResult,
+    *,
+    placeholder_digest: str,
+) -> dict[str, object]:
+    return {
+        "name": "credential-allowed", "argv": list(result.argv),
+        "returncode": result.returncode,
+        "stdout": f"<opaque-placeholder:{placeholder_digest}>\n",
+        "stderr": result.stderr,
+    }
 
 
 def _evaluator_dockerfile(config: OpenShellRunConfig) -> str:
@@ -188,7 +225,7 @@ def _run_manifest(
         task=TaskSpec(
             task_id="openshell-policy-probes/v1",
             digest=_digest_bytes(b"openshell-policy-probes/v1"),
-            objective="Capture real OpenShell policy and teardown evidence",
+            objective="Capture real OpenShell policy, credential and teardown evidence",
             evidence_mode=EvidenceMode.GRAY,
         ),
         candidate=CandidateRef("openshell-probe-candidate/v1", candidate_digest),
@@ -224,6 +261,9 @@ def produce_openshell_evidence(
     evaluator_source_path = output_dir / "evaluator-source.txt"
     evaluator_source_path.write_text(secrets.token_hex(32) + "\n")
     evaluator_artifact_digest = _digest_file(evaluator_source_path)
+    credential_canary = secrets.token_hex(32)
+    credential_canary_digest = _digest_bytes(credential_canary.encode())
+    credential_provider_name = _credential_provider_name(config)
     temporary_base_tag = _temporary_base_tag(config)
     dockerfile_path = output_dir / "Dockerfile.evaluator"
     dockerfile_path.write_text(_evaluator_dockerfile(config))
@@ -246,10 +286,55 @@ def produce_openshell_evidence(
     events = [_event("version", version)]
     candidate_created = False
     verifier_created = False
+    provider_created = False
+    provider_create_attempted = False
     image_built = False
     base_tag_created = False
     verifier_sandbox_name = config.sandbox_name + "-verifier"
     try:
+        provider_preflight = runner((
+            "openshell", "provider", "get", credential_provider_name,
+        ))
+        events.append(_event("provider-preflight", provider_preflight))
+        if provider_preflight.returncode == 0:
+            raise RuntimeError(
+                f"temporary credential provider already exists: {credential_provider_name}"
+            )
+        candidate_preflight = runner((
+            "openshell", "sandbox", "get", config.sandbox_name,
+        ))
+        events.append(_event("candidate-preflight", candidate_preflight))
+        if candidate_preflight.returncode == 0:
+            raise RuntimeError(f"candidate sandbox already exists: {config.sandbox_name}")
+        verifier_preflight = runner((
+            "openshell", "sandbox", "get", verifier_sandbox_name,
+        ))
+        events.append(_event("verifier-preflight", verifier_preflight))
+        if verifier_preflight.returncode == 0:
+            raise RuntimeError(f"verifier sandbox already exists: {verifier_sandbox_name}")
+        provider_create_attempted = True
+        provider_create = runner((
+            "openshell", "provider", "create", "--name", credential_provider_name,
+            "--type", "generic", "--credential",
+            f"{ALLOWED_CREDENTIAL_NAME}={credential_canary}",
+        ))
+        events.append(_redacted_provider_create_event(
+            provider_create,
+            credential_canary=credential_canary,
+            credential_canary_digest=credential_canary_digest,
+        ))
+        _require_code(provider_create, 0, "credential provider create")
+        provider_created = True
+        provider_get = runner((
+            "openshell", "provider", "get", credential_provider_name,
+        ))
+        events.append(_event("provider-get", provider_get))
+        _require_code(provider_get, 0, "credential provider metadata")
+        if credential_canary in provider_get.stdout or credential_canary in provider_get.stderr:
+            raise RuntimeError("provider metadata exposed the credential canary")
+        if ALLOWED_CREDENTIAL_NAME not in provider_get.stdout \
+                or DENIED_CREDENTIAL_NAME in provider_get.stdout:
+            raise RuntimeError("provider metadata credential names drifted")
         tag_preflight = runner(("docker", "image", "inspect", temporary_base_tag))
         events.append(_event("base-tag-preflight", tag_preflight))
         if tag_preflight.returncode == 0:
@@ -282,6 +367,7 @@ def produce_openshell_evidence(
             "base_image_digest": config.image_digest,
             "derived_image_digest": derived_image_digest,
             "temporary_base_tag": temporary_base_tag,
+            "credential_provider_name": credential_provider_name,
         }
         environment_digest = _digest_bytes(_canonical_bytes(environment))
         manifest_contract = _run_manifest(
@@ -294,7 +380,8 @@ def produce_openshell_evidence(
         )
         create = runner((
             "openshell", "sandbox", "create", "--name", config.sandbox_name,
-            "--from", derived_image_digest, "--no-auto-providers", "--no-tty", "--", "/bin/true",
+            "--from", derived_image_digest, "--provider", credential_provider_name,
+            "--no-auto-providers", "--no-tty", "--", "/bin/true",
         ))
         events.append(_event("candidate-create", create))
         _require_code(create, 0, "sandbox create")
@@ -348,6 +435,14 @@ def produce_openshell_evidence(
         probes = [
             ("candidate", ("openshell", "sandbox", "exec", "--name", config.sandbox_name,
                            "--no-tty", "--", "/bin/sh", "/sandbox/candidate.sh")),
+            ("credential-allowed", (
+                "openshell", "sandbox", "exec", "--name", config.sandbox_name,
+                "--no-tty", "--", "/usr/bin/printenv", ALLOWED_CREDENTIAL_NAME,
+            )),
+            ("credential-denied", (
+                "openshell", "sandbox", "exec", "--name", config.sandbox_name,
+                "--no-tty", "--", "/usr/bin/printenv", DENIED_CREDENTIAL_NAME,
+            )),
             ("read-only-deny", ("openshell", "sandbox", "exec", "--name", config.sandbox_name,
                                 "--no-tty", "--", "/usr/bin/touch", "/etc/blackbox-evidence-probe")),
             ("network-allow", ("openshell", "sandbox", "exec", "--name", config.sandbox_name,
@@ -371,10 +466,29 @@ def produce_openshell_evidence(
             )),
         ]
         probe_results: dict[str, CommandResult] = {}
+        credential_placeholder_digest = ""
         for name, argv in probes:
             probe_results[name] = runner(argv)
-            events.append(_event(name, probe_results[name]))
+            result = probe_results[name]
+            if credential_canary in result.stdout or credential_canary in result.stderr:
+                raise RuntimeError(f"{name} exposed the credential canary")
+            if name == "credential-allowed":
+                placeholder = result.stdout.strip()
+                if result.returncode != 0 or not placeholder:
+                    raise RuntimeError("allowed credential placeholder was not injected")
+                credential_placeholder_digest = _digest_bytes(placeholder.encode())
+                if credential_placeholder_digest == credential_canary_digest:
+                    raise RuntimeError("allowed credential exposed the real canary")
+                events.append(_redacted_placeholder_event(
+                    result, placeholder_digest=credential_placeholder_digest,
+                ))
+            else:
+                events.append(_event(name, result))
         _require_code(probe_results["candidate"], 0, "candidate")
+        _require_code(probe_results["credential-allowed"], 0, "allowed credential lookup")
+        if probe_results["credential-denied"].returncode == 0 \
+                or probe_results["credential-denied"].stdout:
+            raise RuntimeError("denied credential name was unexpectedly exposed")
         _require_code(probe_results["network-allow"], 0, "allowed network probe")
         if probe_results["read-only-deny"].returncode == 0:
             raise RuntimeError("read-only filesystem probe unexpectedly succeeded")
@@ -471,9 +585,28 @@ def produce_openshell_evidence(
             events.append(_event("base-tag-absence", tag_absence))
             if tag_absence.returncode == 0:
                 cleanup_errors.append("temporary base tag still exists after cleanup")
+        if provider_create_attempted:
+            provider_remove = runner((
+                "openshell", "provider", "delete", credential_provider_name,
+            ))
+            events.append(_event("provider-remove", provider_remove))
+            if provider_created and provider_remove.returncode != 0:
+                cleanup_errors.append(
+                    f"temporary credential provider cleanup returned {provider_remove.returncode}"
+                )
+            provider_absence = _absence_event(
+                "provider-absence",
+                ("openshell", "provider", "get", credential_provider_name),
+                runner=runner,
+            )
+            events.append(provider_absence)
+            if provider_absence["returncode"] == 0:
+                cleanup_errors.append("temporary credential provider still exists after cleanup")
         if cleanup_errors:
             raise RuntimeError("; ".join(cleanup_errors))
     trajectory = {"schema": TRAJECTORY_SCHEMA, "run_id": config.run_id, "events": events}
+    if credential_canary in _canonical_bytes(trajectory).decode():
+        raise RuntimeError("trajectory exposed the credential canary")
     trajectory_path = output_dir / "trajectory.json"
     _write_json(trajectory_path, trajectory)
     outcome_path = output_dir / "outcome.txt"
@@ -485,11 +618,14 @@ def produce_openshell_evidence(
     outcome = {
         "schema": OUTCOME_SCHEMA,
         "verified_probes": ["writable-filesystem", "read-only-filesystem-deny", "network-allow",
-                            "network-deny", "budget-abort", "evaluator-read-deny",
+                            "network-deny", "credential-allow", "credential-deny",
+                            "budget-abort", "evaluator-read-deny",
                             "evaluator-mutation-deny", "evaluator-exfiltration-deny", "teardown"],
-        "unproven_probes": ["credential-broker"],
+        "unproven_probes": [],
         "maturity_before": CURRENT_MATURITY,
-        "maturity_after": CURRENT_MATURITY,
+        "maturity_after": TARGET_MATURITY,
+        "credential_canary_digest": credential_canary_digest,
+        "credential_placeholder_digest": credential_placeholder_digest,
         "evaluator_artifact_digest": evaluator_artifact_digest,
         "outcome_digest": expected_outcome_digest,
     }
@@ -498,7 +634,7 @@ def produce_openshell_evidence(
     finished_at = datetime.now(timezone.utc)
     manifest = {
         "schema": EVIDENCE_SCHEMA,
-        "status": "partial-live-evidence",
+        "status": "live-evidence",
         "run_manifest": json.loads(manifest_contract.canonical_json()),
         "environment": environment,
         "runtime": {
@@ -543,7 +679,7 @@ def verify_openshell_evidence(
         "schema", "status", "run_manifest", "environment", "runtime", "timing", "evidence"
     }:
         raise EvidenceVerificationError("manifest keys drift")
-    if manifest["schema"] != EVIDENCE_SCHEMA or manifest["status"] != "partial-live-evidence":
+    if manifest["schema"] != EVIDENCE_SCHEMA or manifest["status"] != "live-evidence":
         raise EvidenceVerificationError("manifest identity drift")
     evidence = manifest.get("evidence")
     if not isinstance(evidence, dict):
@@ -565,11 +701,12 @@ def verify_openshell_evidence(
     environment = manifest.get("environment")
     if not isinstance(environment, dict) or set(environment) != {
         "provider", "version", "base_image_digest", "derived_image_digest",
-        "temporary_base_tag"
+        "temporary_base_tag", "credential_provider_name"
     } or environment.get("provider") != "openshell" \
             or environment.get("version") != expected_config.expected_version \
             or environment.get("base_image_digest") != expected_config.image_digest \
             or environment.get("temporary_base_tag") != _temporary_base_tag(expected_config) \
+            or environment.get("credential_provider_name") != _credential_provider_name(expected_config) \
             or not _DIGEST_RE.fullmatch(str(environment.get("derived_image_digest", ""))):
         raise EvidenceVerificationError("environment drift")
     runtime = manifest.get("runtime")
@@ -658,35 +795,40 @@ def verify_openshell_evidence(
         raise EvidenceVerificationError("trajectory events must be a list")
     by_name = {event.get("name"): event for event in events if isinstance(event, dict)}
     expected_sequence = [
-        "version", "base-tag-preflight", "base-tag-create", "base-tag-inspect", "image-build",
+        "version", "provider-preflight", "candidate-preflight", "verifier-preflight",
+        "provider-create", "provider-get", "base-tag-preflight", "base-tag-create",
+        "base-tag-inspect", "image-build",
         "candidate-create", "candidate-get", "policy-update", "effective-policy",
         "candidate-upload",
-        "candidate", "read-only-deny", "network-allow", "network-deny", "budget-abort",
+        "candidate", "credential-allowed", "credential-denied", "read-only-deny",
+        "network-allow", "network-deny", "budget-abort",
         "evaluator-read-deny", "evaluator-mutation-deny", "evaluator-exfiltration-deny",
         "outcome-download", "candidate-delete", "candidate-absence", "verifier-create",
         "verifier-get", "evaluator-readback", "verifier-delete", "verifier-absence",
         "image-remove", "image-absence", "base-tag-remove",
-        "base-tag-absence",
+        "base-tag-absence", "provider-remove", "provider-absence",
     ]
     if [event.get("name") for event in events if isinstance(event, dict)] != expected_sequence \
             or len(events) != len(expected_sequence):
         raise EvidenceVerificationError("trajectory event set drift")
-    expected_codes = {"version": 0, "base-tag-create": 0, "base-tag-inspect": 0,
+    expected_codes = {"version": 0, "provider-create": 0, "provider-get": 0,
+                      "base-tag-create": 0, "base-tag-inspect": 0,
                       "image-build": 0, "candidate-create": 0, "candidate-get": 0,
                       "policy-update": 0, "effective-policy": 0,
-                      "candidate-upload": 0, "candidate": 0,
+                      "candidate-upload": 0, "candidate": 0, "credential-allowed": 0,
                       "network-allow": 0, "budget-abort": 124, "outcome-download": 0,
                       "candidate-delete": 0, "verifier-create": 0, "verifier-get": 0,
                       "evaluator-readback": 0, "verifier-delete": 0,
-                      "image-remove": 0, "base-tag-remove": 0}
+                      "image-remove": 0, "base-tag-remove": 0, "provider-remove": 0}
     for name, code in expected_codes.items():
         if by_name.get(name, {}).get("returncode") != code:
             raise EvidenceVerificationError(f"{name} result drift")
     for name in (
-        "read-only-deny", "network-deny", "evaluator-read-deny",
+        "provider-preflight", "candidate-preflight", "verifier-preflight",
+        "credential-denied", "read-only-deny", "network-deny", "evaluator-read-deny",
         "evaluator-mutation-deny", "evaluator-exfiltration-deny",
         "base-tag-preflight", "candidate-absence", "verifier-absence", "image-absence",
-        "base-tag-absence"
+        "base-tag-absence", "provider-absence"
     ):
         code = by_name.get(name, {}).get("returncode")
         if not isinstance(code, int) or isinstance(code, bool) or code == 0:
@@ -698,11 +840,55 @@ def verify_openshell_evidence(
         event_output = str(by_name[name].get("stdout", "")) + str(by_name[name].get("stderr", ""))
         if canary in event_output:
             raise EvidenceVerificationError(f"{name} exposed evaluator canary")
+    credential_canary_digest = outcome.get("credential_canary_digest")
+    credential_placeholder_digest = outcome.get("credential_placeholder_digest")
+    if not _DIGEST_RE.fullmatch(str(credential_canary_digest)) \
+            or not _DIGEST_RE.fullmatch(str(credential_placeholder_digest)) \
+            or credential_canary_digest == credential_placeholder_digest:
+        raise EvidenceVerificationError("credential digest identity drift")
+    credential_provider_name = _credential_provider_name(expected_config)
+    expected_provider_create = [
+        "openshell", "provider", "create", "--name", credential_provider_name,
+        "--type", "generic", "--credential",
+        f"{ALLOWED_CREDENTIAL_NAME}=<redacted:{credential_canary_digest}>",
+    ]
+    if by_name["provider-preflight"].get("argv") != [
+        "openshell", "provider", "get", credential_provider_name,
+    ] or by_name["provider-create"].get("argv") != expected_provider_create \
+            or by_name["provider-get"].get("argv") != [
+                "openshell", "provider", "get", credential_provider_name,
+            ]:
+        raise EvidenceVerificationError("credential provider command drift")
+    provider_metadata = str(by_name["provider-get"].get("stdout", ""))
+    if ALLOWED_CREDENTIAL_NAME not in provider_metadata \
+            or DENIED_CREDENTIAL_NAME in provider_metadata:
+        raise EvidenceVerificationError("credential provider metadata drift")
+    expected_allowed_credential = [
+        "openshell", "sandbox", "exec", "--name", expected_config.sandbox_name,
+        "--no-tty", "--", "/usr/bin/printenv", ALLOWED_CREDENTIAL_NAME,
+    ]
+    expected_denied_credential = [
+        "openshell", "sandbox", "exec", "--name", expected_config.sandbox_name,
+        "--no-tty", "--", "/usr/bin/printenv", DENIED_CREDENTIAL_NAME,
+    ]
+    if by_name["credential-allowed"].get("argv") != expected_allowed_credential \
+            or by_name["credential-allowed"].get("stdout") != (
+                f"<opaque-placeholder:{credential_placeholder_digest}>\n"
+            ):
+        raise EvidenceVerificationError("credential placeholder drift")
+    if by_name["credential-denied"].get("argv") != expected_denied_credential \
+            or by_name["credential-denied"].get("stdout"):
+        raise EvidenceVerificationError("denied credential result drift")
     expected_create = [
         "openshell", "sandbox", "create", "--name", expected_config.sandbox_name,
-        "--from", environment["derived_image_digest"], "--no-auto-providers", "--no-tty", "--", "/bin/true",
+        "--from", environment["derived_image_digest"], "--provider", credential_provider_name,
+        "--no-auto-providers", "--no-tty", "--", "/bin/true",
     ]
-    if by_name["candidate-create"].get("argv") != expected_create:
+    if by_name["candidate-preflight"].get("argv") != [
+        "openshell", "sandbox", "get", expected_config.sandbox_name,
+    ] or by_name["verifier-preflight"].get("argv") != [
+        "openshell", "sandbox", "get", expected_config.sandbox_name + "-verifier",
+    ] or by_name["candidate-create"].get("argv") != expected_create:
         raise EvidenceVerificationError("sandbox create command drift")
     if runtime["candidate_sandbox_id"] not in str(by_name["candidate-get"].get("stdout", "")):
         raise EvidenceVerificationError("sandbox identity event drift")
@@ -765,6 +951,12 @@ def verify_openshell_evidence(
         "docker", "image", "inspect", temporary_base_tag
     ]:
         raise EvidenceVerificationError("temporary base tag cleanup drift")
+    if by_name["provider-remove"].get("argv") != [
+        "openshell", "provider", "delete", credential_provider_name,
+    ] or by_name["provider-absence"].get("argv") != [
+        "openshell", "provider", "get", credential_provider_name,
+    ]:
+        raise EvidenceVerificationError("credential provider cleanup drift")
     if by_name["evaluator-read-deny"].get("argv", [])[-2:] != [
         "/usr/bin/cat", EVALUATOR_SANDBOX_PATH
     ]:
@@ -778,11 +970,14 @@ def verify_openshell_evidence(
     if outcome != {
         "schema": OUTCOME_SCHEMA,
         "verified_probes": ["writable-filesystem", "read-only-filesystem-deny", "network-allow",
-                            "network-deny", "budget-abort", "evaluator-read-deny",
+                            "network-deny", "credential-allow", "credential-deny",
+                            "budget-abort", "evaluator-read-deny",
                             "evaluator-mutation-deny", "evaluator-exfiltration-deny", "teardown"],
-        "unproven_probes": ["credential-broker"],
+        "unproven_probes": [],
         "maturity_before": CURRENT_MATURITY,
-        "maturity_after": CURRENT_MATURITY,
+        "maturity_after": TARGET_MATURITY,
+        "credential_canary_digest": credential_canary_digest,
+        "credential_placeholder_digest": credential_placeholder_digest,
         "evaluator_artifact_digest": evaluator_artifact_digest,
         "outcome_digest": _digest_bytes(b"openshell-live-evidence-v1\n"),
     }:
@@ -792,4 +987,5 @@ def verify_openshell_evidence(
     if _digest_file(bundle_dir / "evaluator-after.txt") != evaluator_artifact_digest:
         raise EvidenceVerificationError("evaluator artifact mutation detected")
     return {"schema": VERIFICATION_SCHEMA, "verified": True,
-            "maturity_decision": "unchanged", "unproven_probes": outcome["unproven_probes"]}
+            "maturity_decision": "advance-to-L3",
+            "unproven_probes": outcome["unproven_probes"]}

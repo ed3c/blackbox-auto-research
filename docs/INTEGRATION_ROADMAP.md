@@ -34,11 +34,11 @@ A closed v0.x issue does not imply a live integration is production-ready.
                          └──> #29 release readiness
 ```
 
-## Open v1.0 work
+## v1.0 integration status
 
 | Issue | Integration | Current | Target | Contract |
 | --- | --- | --- | --- | --- |
-| #19 | OpenShell | L1 | L3 | `integrations/openshell.md` |
+| #19 | OpenShell | L3 | L3 | `integrations/openshell.md` |
 | #20 | NeMo Gym | L1 | L3 | `integrations/nemo-gym.md` |
 | #21 | Enroot GPU/HPC | L1 | L3 | `integrations/enroot.md` |
 | #22 | iOS + Android | L1 | L3 | `integrations/mobile.md` |

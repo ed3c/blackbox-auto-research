@@ -16,7 +16,7 @@ from blackbox_autoresearch.openshell_live_evidence import (  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description="Independently verify partial live OpenShell evidence")
+    value = argparse.ArgumentParser(description="Independently verify live OpenShell evidence")
     value.add_argument("--input", type=Path, required=True)
     value.add_argument("--receipt", type=Path, required=True)
     value.add_argument("--run-id", required=True)
