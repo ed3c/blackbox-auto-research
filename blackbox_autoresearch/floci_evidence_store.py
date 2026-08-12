@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -10,16 +10,23 @@ import os
 from pathlib import Path
 import re
 import ssl
+import stat
 from typing import Callable, Mapping
+from urllib.parse import urlparse
 
 from .evidence_lake import BlobStore, S3CompatibleBlobStore
 
 
-EVIDENCE_SCHEMA = "blackbox-floci-evidence-store/v1"
-VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v2"
+EVIDENCE_SCHEMA = "blackbox-floci-evidence-store/v2"
+VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v3"
 PROVIDER_KIND = "floci-emulator"
 MATURITY = "L2 SANDBOX"
-WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v1"
+WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v2"
+VERIFICATION_LIMITATIONS = (
+    "Floci is a local AWS emulator, not a production object store",
+    "configured emulator controls require planted-negative outcome verification",
+    "managed KMS/HSM, multi-host metadata, backup/restore, and L4 controls remain unproven",
+)
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -30,6 +37,24 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _read_regular_file(path: Path, name: str, *, maximum: int = 1024 * 1024) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{name} must be a regular file")
+        if status.st_size > maximum:
+            raise ValueError(f"{name} exceeds size limit")
+        payload = bytearray()
+        while chunk := os.read(descriptor, 65536):
+            payload.extend(chunk)
+            if len(payload) > maximum:
+                raise ValueError(f"{name} exceeds size limit")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
 
 
 def _timestamp(clock: Callable[[], datetime]) -> str:
@@ -87,6 +112,37 @@ class FlociEnvironment:
 
 
 @dataclass(frozen=True)
+class FlociPhaseTarget:
+    container_id: str
+    image_id: str
+    endpoint: str
+    ca_bundle_sha256: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", self.container_id) is None:
+            raise ValueError("Floci container_id must be 64 lowercase hex chars")
+        _require_digest(self.image_id, "Floci phase image_id")
+        parsed = urlparse(self.endpoint)
+        if not (
+            parsed.scheme == "https"
+            and parsed.hostname == "127.0.0.1"
+            and parsed.port is not None
+            and parsed.path == ""
+            and parsed.params == ""
+            and parsed.query == ""
+            and parsed.fragment == ""
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            raise ValueError("Floci phase endpoint must be loopback HTTPS")
+        _require_digest(self.ca_bundle_sha256, "Floci phase CA bundle")
+
+    @property
+    def digest(self) -> str:
+        return _digest(_canonical(asdict(self)))
+
+
+@dataclass(frozen=True)
 class FlociEvidenceIdentity:
     run_id: str
     task_digest: str
@@ -107,11 +163,14 @@ class FlociEvidenceIdentity:
         ):
             _require_digest(getattr(self, name), name)
 
-    def manifest_identities(self, environment: FlociEnvironment) -> dict[str, str]:
+    def manifest_identities(
+        self, environment: FlociEnvironment, phase_target: FlociPhaseTarget
+    ) -> dict[str, str]:
         return {
             "task": self.task_digest,
             "candidate": self.candidate_digest,
             "environment": environment.digest,
+            "phase_target": phase_target.digest,
             "harness": self.harness_digest,
             "evaluator": self.evaluator_digest,
             "policy": self.policy_digest,
@@ -125,7 +184,10 @@ class FlociWorkerConfig:
     region: str
     ca_bundle: Path
     environment: FlociEnvironment
+    producer_phase_target: FlociPhaseTarget
+    phase_target: FlociPhaseTarget
     identity: FlociEvidenceIdentity
+    ca_bundle_pem: bytes = field(repr=False)
 
     @classmethod
     def load(cls, path: Path) -> "FlociWorkerConfig":
@@ -137,26 +199,50 @@ class FlociWorkerConfig:
             raise ValueError("worker config must be an object")
         _require_exact_keys(
             value,
-            {"schema", "endpoint", "bucket", "region", "ca_bundle", "environment", "identity"},
+            {
+                "schema", "endpoint", "bucket", "region", "ca_bundle", "environment",
+                "producer_phase_target", "phase_target", "identity",
+            },
             "worker config",
         )
         if value.get("schema") != WORKER_CONFIG_SCHEMA:
             raise ValueError("worker config schema mismatch")
         environment = _require_mapping(value.get("environment"), "environment")
+        producer_phase_target = _require_mapping(
+            value.get("producer_phase_target"), "producer_phase_target"
+        )
+        phase_target = _require_mapping(value.get("phase_target"), "phase_target")
         identity = _require_mapping(value.get("identity"), "identity")
+        ca_bundle = Path(str(value["ca_bundle"]))
+        ca_bundle_pem = _read_regular_file(ca_bundle, "worker CA bundle")
         try:
             result = cls(
                 endpoint=str(value["endpoint"]),
                 bucket=str(value["bucket"]),
                 region=str(value["region"]),
-                ca_bundle=Path(str(value["ca_bundle"])),
+                ca_bundle=ca_bundle,
                 environment=FlociEnvironment(**environment),
+                producer_phase_target=FlociPhaseTarget(**producer_phase_target),
+                phase_target=FlociPhaseTarget(**phase_target),
                 identity=FlociEvidenceIdentity(**identity),
+                ca_bundle_pem=ca_bundle_pem,
             )
         except TypeError as exc:
             raise ValueError(f"worker config fields drift: {exc}") from exc
-        if not result.ca_bundle.is_file() or result.ca_bundle.is_symlink():
-            raise ValueError("worker CA bundle must be a regular file")
+        if result.endpoint != result.phase_target.endpoint:
+            raise ValueError("worker endpoint does not match current phase target")
+        if result.environment.image_id != result.phase_target.image_id:
+            raise ValueError("worker image does not match current phase target")
+        if (
+            result.producer_phase_target.container_id
+            != result.phase_target.container_id
+            or result.producer_phase_target.image_id != result.phase_target.image_id
+            or result.producer_phase_target.ca_bundle_sha256
+            != result.phase_target.ca_bundle_sha256
+        ):
+            raise ValueError("worker phase target identity drift")
+        if _digest(result.ca_bundle_pem) != result.phase_target.ca_bundle_sha256:
+            raise ValueError("worker CA bundle digest mismatch")
         return result
 
     def store(self, environ: Mapping[str, str] | None = None) -> S3CompatibleBlobStore:
@@ -165,7 +251,11 @@ class FlociWorkerConfig:
         secret_key = credentials.get("AWS_SECRET_ACCESS_KEY", "")
         if not access_key or not secret_key:
             raise ValueError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required")
-        context = ssl.create_default_context(cafile=str(self.ca_bundle))
+        try:
+            ca_data = self.ca_bundle_pem.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("worker CA bundle must be ASCII PEM") from exc
+        context = ssl.create_default_context(cadata=ca_data)
         return S3CompatibleBlobStore(
             endpoint=self.endpoint,
             bucket=self.bucket,
@@ -182,6 +272,7 @@ def produce_floci_evidence(
     payload: bytes,
     *,
     environment: FlociEnvironment,
+    phase_target: FlociPhaseTarget,
     identity: FlociEvidenceIdentity,
     producer_pid: int | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -199,7 +290,8 @@ def produce_floci_evidence(
         "production_claim_allowed": False,
         "run": {"run_id": identity.run_id, "producer_pid": process_id},
         "environment": asdict(environment),
-        "identities": identity.manifest_identities(environment),
+        "phase_target": asdict(phase_target),
+        "identities": identity.manifest_identities(environment, phase_target),
         "artifact": {"digest": artifact.digest, "size": artifact.size},
         "produced_at": _timestamp(clock or (lambda: datetime.now(timezone.utc))),
     }
@@ -221,6 +313,8 @@ def verify_floci_evidence(
     manifest: Mapping[str, object],
     *,
     expected_environment: FlociEnvironment,
+    expected_producer_phase_target: FlociPhaseTarget,
+    verifier_phase_target: FlociPhaseTarget,
     expected_identity: FlociEvidenceIdentity,
     verifier_pid: int | None = None,
     run_planted_negative: bool = False,
@@ -235,6 +329,7 @@ def verify_floci_evidence(
             "production_claim_allowed",
             "run",
             "environment",
+            "phase_target",
             "identities",
             "artifact",
             "produced_at",
@@ -258,7 +353,11 @@ def verify_floci_evidence(
         raise ValueError("produced_at is later than verification time")
     if manifest.get("environment") != asdict(expected_environment):
         raise ValueError("Floci environment identity drift")
-    if manifest.get("identities") != expected_identity.manifest_identities(expected_environment):
+    if manifest.get("phase_target") != asdict(expected_producer_phase_target):
+        raise ValueError("Floci producer phase target drift")
+    if manifest.get("identities") != expected_identity.manifest_identities(
+        expected_environment, expected_producer_phase_target
+    ):
         raise ValueError("evidence identities drift")
 
     run = _require_mapping(manifest.get("run"), "run")
@@ -300,14 +399,12 @@ def verify_floci_evidence(
         "run_id": expected_identity.run_id,
         "artifact_digest": digest,
         "environment_digest": expected_environment.digest,
+        "producer_phase_target_digest": expected_producer_phase_target.digest,
+        "verifier_phase_target_digest": verifier_phase_target.digest,
         "producer_pid": producer_pid,
         "verifier_pid": process_id,
         "process_separation": "verified",
         "local_digest_negative": local_digest_negative,
-        "limitations": [
-            "Floci is a local AWS emulator, not a production object store",
-            "configured emulator controls require planted-negative outcome verification",
-            "managed KMS/HSM, multi-host metadata, backup/restore, and L4 controls remain unproven",
-        ],
+        "limitations": list(VERIFICATION_LIMITATIONS),
         "verified_at": verification_time.isoformat(),
     }

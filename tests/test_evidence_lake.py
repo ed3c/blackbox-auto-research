@@ -1,10 +1,12 @@
 import sqlite3
+import json
 import tempfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from blackbox_autoresearch.evidence_lake import (
     ArtifactRecord,
@@ -16,6 +18,9 @@ from blackbox_autoresearch.evidence_lake import (
 from blackbox_autoresearch.floci_evidence_store import (
     FlociEvidenceIdentity,
     FlociEnvironment,
+    FlociPhaseTarget,
+    FlociWorkerConfig,
+    WORKER_CONFIG_SCHEMA,
     produce_floci_evidence,
     verify_floci_evidence,
 )
@@ -95,6 +100,66 @@ class _MemoryBlobStore:
 
 
 class EvidenceLakeTests(unittest.TestCase):
+    def test_floci_worker_config_binds_endpoint_and_ca_to_phase_target(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            ca_bundle = root / "ca.pem"
+            ca_bundle.write_bytes(b"fixture-ca")
+            target = {
+                "container_id": "f" * 64,
+                "image_id": "sha256:" + "b" * 64,
+                "endpoint": "https://127.0.0.1:4566",
+                "ca_bundle_sha256": S3CompatibleBlobStore.digest(b"fixture-ca"),
+            }
+            config = {
+                "schema": WORKER_CONFIG_SCHEMA,
+                "endpoint": target["endpoint"],
+                "bucket": "evidence",
+                "region": "us-east-1",
+                "ca_bundle": str(ca_bundle),
+                "environment": {
+                    "commit": "a" * 40,
+                    "image_id": target["image_id"],
+                    "storage_mode": "wal",
+                    "endpoint_scheme": "https",
+                    "tls_trust": "pinned-self-signed-certificate",
+                    "sigv4_validation_configured": True,
+                    "iam_enforcement": True,
+                },
+                "producer_phase_target": target,
+                "phase_target": target,
+                "identity": {
+                    "run_id": "fixture",
+                    "task_digest": DIGEST_A,
+                    "candidate_digest": DIGEST_B,
+                    "harness_digest": DIGEST_C,
+                    "evaluator_digest": "sha256:" + "d" * 64,
+                    "policy_digest": "sha256:" + "e" * 64,
+                },
+            }
+            path = root / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+
+            loaded = FlociWorkerConfig.load(path)
+            self.assertEqual(loaded.phase_target.endpoint, target["endpoint"])
+            ca_bundle.write_bytes(b"changed-after-load")
+            with patch(
+                "blackbox_autoresearch.floci_evidence_store.ssl.create_default_context"
+            ) as context:
+                loaded.store(
+                    {
+                        "AWS_ACCESS_KEY_ID": "fixture-key",
+                        "AWS_SECRET_ACCESS_KEY": "fixture-secret",
+                    }
+                )
+            context.assert_called_once_with(cadata="fixture-ca")
+
+            config["endpoint"] = "https://127.0.0.1:4567"
+            ca_bundle.write_bytes(b"fixture-ca")
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "endpoint"):
+                FlociWorkerConfig.load(path)
+
     def test_floci_environment_rejects_string_boolean_flags(self):
         with self.assertRaisesRegex(ValueError, "boolean"):
             FlociEnvironment(
@@ -126,10 +191,17 @@ class EvidenceLakeTests(unittest.TestCase):
             evaluator_digest="sha256:" + "d" * 64,
             policy_digest="sha256:" + "e" * 64,
         )
+        phase_target = FlociPhaseTarget(
+            container_id="f" * 64,
+            image_id=environment.image_id,
+            endpoint="https://127.0.0.1:4566",
+            ca_bundle_sha256="sha256:" + "1" * 64,
+        )
         manifest = produce_floci_evidence(
             store,
             b"verified-outcome",
             environment=environment,
+            phase_target=phase_target,
             identity=identity,
             producer_pid=101,
         )
@@ -137,6 +209,8 @@ class EvidenceLakeTests(unittest.TestCase):
             store,
             manifest,
             expected_environment=environment,
+            expected_producer_phase_target=phase_target,
+            verifier_phase_target=phase_target,
             expected_identity=identity,
             verifier_pid=202,
             run_planted_negative=True,
@@ -154,6 +228,8 @@ class EvidenceLakeTests(unittest.TestCase):
                 store,
                 forged,
                 expected_environment=environment,
+                expected_producer_phase_target=phase_target,
+                verifier_phase_target=phase_target,
                 expected_identity=identity,
                 verifier_pid=202,
             )
@@ -164,6 +240,8 @@ class EvidenceLakeTests(unittest.TestCase):
                 store,
                 malformed_time,
                 expected_environment=environment,
+                expected_producer_phase_target=phase_target,
+                verifier_phase_target=phase_target,
                 expected_identity=identity,
                 verifier_pid=202,
             )
@@ -174,6 +252,8 @@ class EvidenceLakeTests(unittest.TestCase):
                 store,
                 future_time,
                 expected_environment=environment,
+                expected_producer_phase_target=phase_target,
+                verifier_phase_target=phase_target,
                 expected_identity=identity,
                 verifier_pid=202,
                 clock=lambda: datetime(2026, 8, 12, tzinfo=timezone.utc),

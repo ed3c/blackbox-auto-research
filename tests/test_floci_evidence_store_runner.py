@@ -9,8 +9,10 @@ from unittest.mock import patch
 from blackbox_autoresearch.floci_evidence_store import VERIFICATION_SCHEMA
 from scripts.run_floci_evidence_store_sandbox import (
     RUN_SCHEMA,
+    AwsCredentials,
     AwsProbeOutcome,
     _create_container,
+    _aws,
     _evaluate_aws_probe,
     _evaluate_teardown,
     _export_evidence_bundle,
@@ -18,16 +20,31 @@ from scripts.run_floci_evidence_store_sandbox import (
     _reproduction_metadata,
     _run_with_artifact_reservation,
     _security_decision,
+    _snapshot_ca,
     _validate_output_paths,
 )
 
 
 class FlociEvidenceStoreRunnerTests(unittest.TestCase):
+    def test_ca_snapshot_is_runner_owned_and_independent_from_provider_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "provider-ca.pem"
+            destination = root / "snapshot.pem"
+            source.write_bytes(b"provider-ca")
+
+            snapshot, payload = _snapshot_ca(source, destination)
+            source.write_bytes(b"provider-mutated")
+
+            self.assertEqual(payload, b"provider-ca")
+            self.assertEqual(snapshot.read_bytes(), b"provider-ca")
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o400)
+
     def test_run_and_verifier_schema_changes_are_explicit(self):
-        self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v2")
+        self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v3")
         self.assertEqual(
             VERIFICATION_SCHEMA,
-            "blackbox-floci-evidence-store-verification/v2",
+            "blackbox-floci-evidence-store-verification/v3",
         )
 
     def test_aws_probe_only_accepts_explicit_expected_service_error(self):
@@ -188,23 +205,51 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
 
     def test_probe_receipt_preserves_raw_result_and_classification(self):
         result = subprocess.CompletedProcess(
-            ("aws",),
-            254,
-            "",
-            "An error occurred (AccessDenied) when calling DeleteObject",
+            ("aws", "--ca-bundle", "/tmp/ca.pem", "s3api", "delete-object"),
+            254, "", "An error occurred (AccessDenied) when calling DeleteObject",
         )
-        outcome = _evaluate_aws_probe(result, {"AccessDenied"})
+        with tempfile.TemporaryDirectory() as raw:
+            ca_bundle = Path(raw) / "ca.pem"
+            ca_bundle.write_bytes(b"fixture-ca")
+            with patch("scripts.run_floci_evidence_store_sandbox._run", return_value=result):
+                execution = _aws(
+                    "https://127.0.0.1:4566",
+                    ca_bundle,
+                    AwsCredentials.configured("fixture-key", "configured").wrong_secret(),
+                    "s3api", "delete-object",
+                )
+        outcome = _evaluate_aws_probe(execution.result, {"AccessDenied"})
 
         self.assertEqual(
-            _probe_receipt("s3-delete-object", result, outcome),
+            _probe_receipt("s3-delete-object", execution, outcome),
             {
                 "operation": "s3-delete-object",
+                "argv": [
+                    "aws",
+                    "--ca-bundle",
+                    "$RUN_CA_BUNDLE",
+                    "s3api",
+                    "delete-object",
+                ],
+                "principal_access_key_sha256": "sha256:66e7c82b49bb291dd09c8e020448311c4a7bb96aeb5c5db769f66812b13a50b5",
+                "credential_variant": "wrong-secret",
+                "ca_bundle_sha256": "sha256:fca046ca96fabdc57856c287f889f3a2a20dc3192abefa0443ae0e6505595fdf",
                 "returncode": 254,
                 "stdout": "",
                 "stderr": "An error occurred (AccessDenied) when calling DeleteObject",
                 "outcome": {"status": "denied", "detail": "AccessDenied"},
             },
         )
+
+    def test_wrong_secret_variant_is_derived_from_a_configured_baseline(self):
+        configured = AwsCredentials.configured("fixture-key", "fixture-secret")
+        wrong = configured.wrong_secret()
+
+        self.assertEqual(wrong.access_key_id, configured.access_key_id)
+        self.assertNotEqual(wrong.secret_access_key, configured.secret_access_key)
+        self.assertEqual(wrong.variant, "wrong-secret")
+        with self.assertRaisesRegex(ValueError, "configured baseline"):
+            wrong.wrong_secret()
 
     def test_reproduction_command_requires_a_new_artifact_directory(self):
         metadata = _reproduction_metadata("a" * 40, "floci-sandbox-example")

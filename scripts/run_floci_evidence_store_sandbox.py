@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import stat
 from typing import Callable, TypeVar
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -26,11 +27,21 @@ sys.path.insert(0, str(ROOT))
 from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
     FlociEnvironment,
     FlociEvidenceIdentity,
+    FlociPhaseTarget,
     WORKER_CONFIG_SCHEMA,
 )
 
 
-RUN_SCHEMA = "blackbox-floci-sandbox-run/v2"
+RUN_SCHEMA = "blackbox-floci-sandbox-run/v3"
+BASE_VERIFIED_SCOPE = (
+    "S3 content-addressed round-trip",
+    "WAL restart",
+    "fresh-process retrieval",
+)
+RUN_LIMITATIONS = (
+    "external production object storage remains unproven",
+    "production metadata/index, managed KMS/HSM, backup/restore, and multi-host recovery remain unproven",
+)
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _AWS_ERROR_RE = re.compile(r"An error occurred \(([^)]+)\)")
 _T = TypeVar("_T")
@@ -40,6 +51,48 @@ _T = TypeVar("_T")
 class AwsProbeOutcome:
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class AwsCredentials:
+    access_key_id: str
+    secret_access_key: str
+    configured_secret_sha256: str
+
+    @classmethod
+    def configured(cls, access_key_id: str, secret_access_key: str) -> "AwsCredentials":
+        if not access_key_id or not secret_access_key:
+            raise ValueError("configured AWS credentials must be non-empty")
+        return cls(access_key_id, secret_access_key, _digest_bytes(secret_access_key.encode()))
+
+    @property
+    def variant(self) -> str:
+        current = _digest_bytes(self.secret_access_key.encode())
+        return "configured-secret" if current == self.configured_secret_sha256 else "wrong-secret"
+
+    def wrong_secret(self) -> "AwsCredentials":
+        if self.variant != "configured-secret":
+            raise ValueError("wrong-secret credentials require a configured baseline")
+        return AwsCredentials(
+            self.access_key_id,
+            self.secret_access_key + "-wrong",
+            self.configured_secret_sha256,
+        )
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "AWS_ACCESS_KEY_ID": self.access_key_id,
+            "AWS_SECRET_ACCESS_KEY": self.secret_access_key,
+        }
+
+
+@dataclass(frozen=True)
+class AwsExecution:
+    result: subprocess.CompletedProcess[str]
+    endpoint: str
+    ca_bundle_sha256: str
+    principal_access_key_sha256: str
+    credential_variant: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +146,25 @@ def _write_json(path: Path, value: object) -> None:
     with path.open("x") as handle:
         json.dump(value, handle, sort_keys=True, separators=(",", ":"))
         handle.write("\n")
+
+
+def _snapshot_ca(source: Path, destination: Path) -> tuple[Path, bytes]:
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > 1024 * 1024:
+            raise ValueError("Floci CA source must be a bounded regular file")
+        payload = bytearray()
+        while chunk := os.read(descriptor, 65536):
+            payload.extend(chunk)
+            if len(payload) > 1024 * 1024:
+                raise ValueError("Floci CA source exceeds size limit")
+    finally:
+        os.close(descriptor)
+    with destination.open("xb") as handle:
+        handle.write(payload)
+    destination.chmod(0o400)
+    return destination, bytes(payload)
 
 
 def _export_evidence_file(source: Path, destination: Path) -> dict[str, object]:
@@ -209,18 +281,19 @@ def _wait_container_ready(name: str, endpoint: str, ca_bundle: Path) -> None:
 def _aws(
     endpoint: str,
     ca_bundle: Path,
-    credentials: dict[str, str],
+    credentials: AwsCredentials,
     *args: str,
     check: bool = True,
-) -> subprocess.CompletedProcess[str]:
+) -> AwsExecution:
+    ca_bundle_bytes = _read_snapshot_ca(ca_bundle)
     environment = {
         **os.environ,
-        **credentials,
+        **credentials.environment(),
         "AWS_DEFAULT_REGION": "us-east-1",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_PAGER": "",
     }
-    return _run(
+    result = _run(
         "aws",
         "--endpoint-url",
         endpoint,
@@ -231,6 +304,15 @@ def _aws(
         env=environment,
         check=check,
     )
+    return AwsExecution(
+        result=result,
+        endpoint=endpoint,
+        ca_bundle_sha256=_digest_bytes(ca_bundle_bytes),
+        principal_access_key_sha256=_digest_bytes(
+            credentials.access_key_id.encode()
+        ),
+        credential_variant=credentials.variant,
+    )
 
 
 def _container_endpoint(name: str) -> str:
@@ -238,6 +320,36 @@ def _container_endpoint(name: str) -> str:
     if len(mapping) != 1 or ":" not in mapping[0]:
         raise RuntimeError(f"unexpected Floci port mapping: {mapping}")
     return "https://127.0.0.1:" + mapping[0].rsplit(":", 1)[1]
+
+
+def _read_snapshot_ca(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > 1024 * 1024:
+            raise ValueError("runner CA snapshot must be a bounded regular file")
+        payload = os.read(descriptor, 1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError("runner CA snapshot exceeds size limit")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _container_target(
+    name: str, endpoint: str, ca_bundle_bytes: bytes, expected_image_id: str
+) -> FlociPhaseTarget:
+    value = _run(
+        "docker", "inspect", name, "--format", "{{.Id}} {{.Image}}", cwd=ROOT
+    ).stdout.strip().split()
+    if len(value) != 2 or value[1] != expected_image_id:
+        raise RuntimeError("Floci container/image identity drift")
+    return FlociPhaseTarget(
+        container_id=value[0],
+        image_id=value[1],
+        endpoint=endpoint,
+        ca_bundle_sha256=_digest_bytes(ca_bundle_bytes),
+    )
 
 
 def _create_container(name: str, image_id: str, data_dir: Path | str) -> None:
@@ -286,11 +398,19 @@ def _security_decision(iam_probe: AwsProbeOutcome, signature_probe: AwsProbeOutc
 
 def _probe_receipt(
     operation: str,
-    result: subprocess.CompletedProcess[str],
+    execution: AwsExecution,
     outcome: AwsProbeOutcome,
 ) -> dict[str, object]:
+    result = execution.result
+    argv = list(result.args)
+    ca_index = argv.index("--ca-bundle") + 1
+    argv[ca_index] = "$RUN_CA_BUNDLE"
     return {
         "operation": operation,
+        "argv": argv,
+        "principal_access_key_sha256": execution.principal_access_key_sha256,
+        "credential_variant": execution.credential_variant,
+        "ca_bundle_sha256": execution.ca_bundle_sha256,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -316,11 +436,8 @@ def _evaluate_teardown(
     )
 
 
-def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
-    bootstrap = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-    username = "blackbox-evidence-writer"
-    _aws(endpoint, ca_bundle, bootstrap, "iam", "create-user", "--user-name", username)
-    policy = {
+def _iam_policy(bucket: str) -> dict[str, object]:
+    return {
         "Version": "2012-10-17",
         "Statement": [
             {"Effect": "Allow", "Action": "s3:CreateBucket", "Resource": "*"},
@@ -331,6 +448,13 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
             },
         ],
     }
+
+
+def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[AwsCredentials, dict[str, object]]:
+    bootstrap = AwsCredentials.configured("test", "test")
+    username = "blackbox-evidence-writer"
+    _aws(endpoint, ca_bundle, bootstrap, "iam", "create-user", "--user-name", username)
+    policy = _iam_policy(bucket)
     _aws(
         endpoint,
         ca_bundle,
@@ -355,11 +479,10 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
         "--output",
         "json",
     )
-    access = json.loads(created.stdout)["AccessKey"]
-    credentials = {
-        "AWS_ACCESS_KEY_ID": access["AccessKeyId"],
-        "AWS_SECRET_ACCESS_KEY": access["SecretAccessKey"],
-    }
+    access = json.loads(created.result.stdout)["AccessKey"]
+    credentials = AwsCredentials.configured(
+        access["AccessKeyId"], access["SecretAccessKey"]
+    )
     return credentials, policy
 
 
@@ -424,20 +547,27 @@ def _execute(
     signature_probe_receipt: dict[str, object] | None = None
     restart_receipt: dict[str, object] | None = None
     policy: dict[str, object] = {}
+    producer_phase_target: FlociPhaseTarget | None = None
+    verifier_phase_target: FlociPhaseTarget | None = None
     with tempfile.TemporaryDirectory(prefix="blackbox-floci-") as temporary:
         runtime = Path(temporary)
         data_dir = runtime / "data"
         data_dir.mkdir()
         data_dir.chmod(0o777)
         ca_bundle = data_dir / "tls" / "floci-selfsigned.crt"
+        ca_snapshot = runtime / "floci-ca-snapshot.pem"
         try:
             print("starting strict Floci sandbox", flush=True)
             _create_container(container_name, image_id, data_dir)
             container_created = True
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
+            ca_snapshot, ca_snapshot_bytes = _snapshot_ca(ca_bundle, ca_snapshot)
+            producer_phase_target = _container_target(
+                container_name, endpoint, ca_snapshot_bytes, image_id
+            )
             print("bootstrapping restricted IAM principal", flush=True)
-            credentials, policy = _bootstrap_iam(endpoint, ca_bundle, f"evidence-{commit[:12]}")
+            credentials, policy = _bootstrap_iam(endpoint, ca_snapshot, f"evidence-{commit[:12]}")
             identity = FlociEvidenceIdentity(
                 run_id=args.run_id,
                 task_digest=_digest_bytes(b"floci-s3-content-addressed-round-trip/v1"),
@@ -457,8 +587,10 @@ def _execute(
                 "endpoint": endpoint,
                 "bucket": f"evidence-{commit[:12]}",
                 "region": "us-east-1",
-                "ca_bundle": str(ca_bundle),
+                "ca_bundle": str(ca_snapshot),
                 "environment": environment.__dict__,
+                "producer_phase_target": producer_phase_target.__dict__,
+                "phase_target": producer_phase_target.__dict__,
                 "identity": identity.__dict__,
             }
             config_path = runtime / "config.json"
@@ -477,7 +609,7 @@ def _execute(
                 },
             )
             _write_json(policy_path, policy)
-            worker_env = {**os.environ, **credentials}
+            worker_env = {**os.environ, **credentials.environment()}
             _run(
                 sys.executable,
                 str(ROOT / "scripts" / "produce_floci_evidence_store.py"),
@@ -494,8 +626,15 @@ def _execute(
             stopped = _run("docker", "stop", container_name, cwd=ROOT)
             restarted = _run("docker", "start", container_name, cwd=ROOT)
             endpoint = _container_endpoint(container_name)
-            _wait_container_ready(container_name, endpoint, ca_bundle)
-            verifier_config = {**config, "endpoint": endpoint}
+            _wait_container_ready(container_name, endpoint, ca_snapshot)
+            verifier_phase_target = _container_target(
+                container_name, endpoint, ca_snapshot_bytes, image_id
+            )
+            verifier_config = {
+                **config,
+                "endpoint": endpoint,
+                "phase_target": verifier_phase_target.__dict__,
+            }
             verifier_config_path = runtime / "verifier-config.json"
             _write_json(verifier_config_path, verifier_config)
             _run(
@@ -522,7 +661,7 @@ def _execute(
             key = f"artifacts/{artifact_digest[:2]}/{artifact_digest[2:]}"
             denied = _aws(
                 endpoint,
-                ca_bundle,
+                ca_snapshot,
                 credentials,
                 "s3api",
                 "delete-object",
@@ -532,16 +671,17 @@ def _execute(
                 key,
                 check=False,
             )
-            iam_probe = _evaluate_aws_probe(denied, {"AccessDenied", "AccessDeniedException"})
-            iam_probe_receipt = _probe_receipt("s3-delete-object", denied, iam_probe)
+            iam_probe = _evaluate_aws_probe(denied.result, {"AccessDenied", "AccessDeniedException"})
+            iam_probe_receipt = _probe_receipt(
+                "s3-delete-object",
+                denied,
+                iam_probe,
+            )
             iam_delete_denied = iam_probe.status == "denied"
-            wrong_credentials = {
-                "AWS_ACCESS_KEY_ID": credentials["AWS_ACCESS_KEY_ID"],
-                "AWS_SECRET_ACCESS_KEY": credentials["AWS_SECRET_ACCESS_KEY"] + "-wrong",
-            }
+            wrong_credentials = credentials.wrong_secret()
             bad_signature = _aws(
                 endpoint,
-                ca_bundle,
+                ca_snapshot,
                 wrong_credentials,
                 "s3api",
                 "head-object",
@@ -552,11 +692,13 @@ def _execute(
                 check=False,
             )
             signature_probe = _evaluate_aws_probe(
-                bad_signature,
+                bad_signature.result,
                 {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
             )
             signature_probe_receipt = _probe_receipt(
-                "s3-head-object-with-wrong-secret", bad_signature, signature_probe
+                "s3-head-object-with-wrong-secret",
+                bad_signature,
+                signature_probe,
             )
             invalid_signature_denied = signature_probe.status == "denied"
             evidence_artifacts = _export_evidence_bundle(
@@ -580,13 +722,15 @@ def _execute(
         or evidence_artifacts is None
         or iam_probe_receipt is None
         or signature_probe_receipt is None
+        or producer_phase_target is None
+        or verifier_phase_target is None
         or restart_receipt is None
         or teardown.status != "container-absent"
     ):
         raise RuntimeError("Floci sandbox did not produce verified evidence and teardown")
     finished_at = datetime.now(timezone.utc).isoformat()
     security_decision = _security_decision(iam_probe, signature_probe)
-    verified_scope = ["S3 content-addressed round-trip", "WAL restart", "fresh-process retrieval"]
+    verified_scope = list(BASE_VERIFIED_SCOPE)
     if iam_delete_denied:
         verified_scope.append("IAM delete deny")
     receipt = {
@@ -601,6 +745,10 @@ def _execute(
         "finished_at": finished_at,
         "source": {"kind": "local-clone", "commit": commit},
         "image_id": image_id,
+        "sandbox": {
+            "producer": producer_phase_target.__dict__,
+            "verifier": verifier_phase_target.__dict__,
+        },
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
         "sigv4_configuration": "enabled",
@@ -615,10 +763,7 @@ def _execute(
         "teardown": teardown.__dict__,
         "verification": verification,
         "evidence_artifacts": evidence_artifacts,
-        "limitations": [
-            "external production object storage remains unproven",
-            "production metadata/index, managed KMS/HSM, backup/restore, and multi-host recovery remain unproven",
-        ],
+        "limitations": list(RUN_LIMITATIONS),
         **_reproduction_metadata(commit, args.run_id),
     }
     _write_json(receipt_path, receipt)

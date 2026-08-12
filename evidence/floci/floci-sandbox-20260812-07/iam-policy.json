@@ -1,0 +1,1 @@
+{"Statement":[{"Action":"s3:CreateBucket","Effect":"Allow","Resource":"*"},{"Action":["s3:GetObject","s3:PutObject"],"Effect":"Allow","Resource":"arn:aws:s3:::evidence-c21337c3b185/artifacts/*"}],"Version":"2012-10-17"}

@@ -37,6 +37,8 @@ def main() -> int:
         config.store(),
         manifest,
         expected_environment=config.environment,
+        expected_producer_phase_target=config.producer_phase_target,
+        verifier_phase_target=config.phase_target,
         expected_identity=config.identity,
         run_planted_negative=args.planted_negative,
     )
