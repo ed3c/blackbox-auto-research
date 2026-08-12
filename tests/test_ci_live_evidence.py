@@ -207,8 +207,8 @@ class CILiveEvidenceTests(unittest.TestCase):
 
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("verify:\n    needs: produce", workflow)
-        self.assertIn("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", workflow)
-        self.assertIn("actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0", workflow)
+        self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", workflow)
+        self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", workflow)
         self.assertIn("--tamper-probe", workflow)
 
 
