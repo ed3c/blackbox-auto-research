@@ -1,0 +1,33 @@
+{
+  "_schema": "forgejo-delivery-registry@0.1.0",
+  "forge": {
+    "kind": "forgejo",
+    "base_url": "http://localhost:3000",
+    "api_base": "http://localhost:3000/api/v1",
+    "auth": "git credential helper; secret remains in memory",
+    "layer4": "milestone"
+  },
+  "required_receipt_fields": [
+    "line",
+    "repo",
+    "issues",
+    "pr",
+    "milestone_url",
+    "synced_at_commit"
+  ],
+  "lines": [
+    {
+      "line": "v1-evidence-lake",
+      "forgejo_repo": "neon/blackbox-auto-research",
+      "prd_issue": "http://localhost:3000/neon/blackbox-auto-research/issues/1",
+      "milestone_url": "http://localhost:3000/neon/blackbox-auto-research/milestone/3",
+      "materialized_path": ".",
+      "plan_doc": "docs/INTEGRATION_ROADMAP.md",
+      "issue_urls": [
+        "http://localhost:3000/neon/blackbox-auto-research/issues/8"
+      ],
+      "pr_urls": [],
+      "note": "Forgejo is a tracking-only projection. Git commits, GitHub issues and evidence remain the source of truth."
+    }
+  ]
+}
