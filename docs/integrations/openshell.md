@@ -34,9 +34,9 @@ python3 scripts/produce_live_openshell_evidence.py --help
 python3 scripts/verify_live_openshell_evidence.py --help
 ```
 
-It records real network, filesystem, budget and teardown probes in a content-addressed
-bundle. It must continue to report `credential-broker` and `evaluator-isolation` as
-unproven until those boundaries have their own real evidence.
+It records real network, filesystem, evaluator-isolation, budget and teardown probes
+in a content-addressed bundle. It must continue to report `credential-broker` as
+unproven until that boundary has its own real evidence.
 
 ## Done
 
