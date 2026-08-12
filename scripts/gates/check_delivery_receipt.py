@@ -79,12 +79,23 @@ def validate(root: Path) -> list[str]:
         line_id = line["line"]
         materialized = line.get("materialized_path")
         if materialized is None:
+            failures.append(f"materialized-path-missing: {line_id}: field is absent")
             continue
         if not isinstance(materialized, str) or not materialized:
             failures.append(f"registry-invalid: {line_id} has invalid materialized_path")
             continue
-        target = root / materialized
+        relative_target = Path(materialized)
+        if relative_target.is_absolute():
+            failures.append(f"materialized-path-escape: {line_id}: path must be relative")
+            continue
+        target = (root / relative_target).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError:
+            failures.append(f"materialized-path-escape: {line_id}: path leaves repo root")
+            continue
         if not target.is_dir():
+            failures.append(f"materialized-path-missing: {line_id}: {materialized}")
             continue
         receipt_path = target / "delivery.json"
         if not receipt_path.is_file():

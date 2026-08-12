@@ -1,5 +1,5 @@
 {
-  "_note": "Tracking-only Forgejo projection receipt. Live issue state is verified explicitly and is not inferred from this zero-network receipt.",
+  "_note": "Tracking-only Forgejo projection receipt. Live issue state is verified explicitly and is not inferred from this zero-network receipt. The required pr field uses an explicit sentinel because this tracking-only repository has no Git branch or pull-request surface.",
   "line": "v1-evidence-lake",
   "repo": "neon/blackbox-auto-research",
   "issues": [

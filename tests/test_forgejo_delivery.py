@@ -84,6 +84,24 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("cross-forge", result.stderr)
 
+    def test_missing_materialized_path_fails_loudly(self) -> None:
+        registry = {
+            "required_receipt_fields": ["line"],
+            "lines": [{"line": "evidence-lake", "materialized_path": "missing"}],
+        }
+        result = self.run_gate(registry, None)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("materialized-path-missing", result.stderr)
+
+    def test_materialized_path_cannot_escape_the_repository(self) -> None:
+        registry = {
+            "required_receipt_fields": ["line"],
+            "lines": [{"line": "evidence-lake", "materialized_path": "../outside"}],
+        }
+        result = self.run_gate(registry, None)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("materialized-path-escape", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
