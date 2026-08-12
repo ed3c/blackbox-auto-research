@@ -1,0 +1,109 @@
+name: live-ci-evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.context.outputs.artifact_name }}
+      runner_os: ${{ steps.context.outputs.runner_os }}
+      runner_arch: ${{ steps.context.outputs.runner_arch }}
+      runner_image_os: ${{ steps.context.outputs.runner_image_os }}
+      runner_image_version: ${{ steps.context.outputs.runner_image_version }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Pin producer context
+        id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ImageOS:?GitHub-hosted runner did not expose ImageOS}"
+          : "${ImageVersion:?GitHub-hosted runner did not expose ImageVersion}"
+          echo "artifact_name=live-ci-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
+          echo "runner_arch=${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+          echo "runner_image_os=${ImageOS}" >> "$GITHUB_OUTPUT"
+          echo "runner_image_version=${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Execute workload and produce evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/produce_live_ci_evidence.py \
+            --output live-ci-evidence \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-commit "$GITHUB_WORKFLOW_SHA" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --runner-image-os "$ImageOS" \
+            --runner-image-version "$ImageVersion"
+      - name: Persist evidence outside the producer job
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.context.outputs.artifact_name }}
+          path: live-ci-evidence
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  verify:
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Retrieve producer evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ needs.produce.outputs.artifact_name }}
+          path: live-ci-evidence
+      - name: Re-verify in a fresh job and run planted tamper probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_live_ci_evidence.py \
+            --input live-ci-evidence \
+            --receipt live-ci-verification/receipt.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-commit "$GITHUB_WORKFLOW_SHA" \
+            --runner-os "${{ needs.produce.outputs.runner_os }}" \
+            --runner-arch "${{ needs.produce.outputs.runner_arch }}" \
+            --runner-image-os "${{ needs.produce.outputs.runner_image_os }}" \
+            --runner-image-version "${{ needs.produce.outputs.runner_image_version }}" \
+            --platform-artifact-digest "${{ needs.produce.outputs.artifact_digest }}" \
+            --tamper-probe
+      - name: Persist independent verification receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: live-ci-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: live-ci-verification/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
