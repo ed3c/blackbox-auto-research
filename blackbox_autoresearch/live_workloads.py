@@ -171,6 +171,16 @@ def run_sqlite_etl_workload() -> WorkloadEvidence:
         )
 
 
+CI_SEEDED_SOURCE = (
+    "import unittest\n\nclass T(unittest.TestCase):\n"
+    "    def test_value(self): print('seeded'); self.assertEqual(1 + 1, 3)\n"
+)
+CI_REPAIRED_SOURCE = (
+    "import unittest\n\nclass T(unittest.TestCase):\n"
+    "    def test_value(self): print('repair'); self.assertEqual(1 + 1, 2)\n"
+)
+
+
 def run_ci_remediation_workload(*, disable_bytecode_cache: bool = True) -> WorkloadEvidence:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -180,21 +190,13 @@ def run_ci_remediation_workload(*, disable_bytecode_cache: bool = True) -> Workl
             test_command.append("-B")
         test_command.extend(("-m", "unittest", "-q"))
         fixed_timestamp_ns = 1_700_000_000_000_000_000
-        seeded_source = (
-            "import unittest\n\nclass T(unittest.TestCase):\n"
-            "    def test_value(self): print('seeded'); self.assertEqual(1 + 1, 3)\n"
-        )
-        repaired_source = (
-            "import unittest\n\nclass T(unittest.TestCase):\n"
-            "    def test_value(self): print('repair'); self.assertEqual(1 + 1, 2)\n"
-        )
-        if len(seeded_source.encode()) != len(repaired_source.encode()):
+        if len(CI_SEEDED_SOURCE.encode()) != len(CI_REPAIRED_SOURCE.encode()):
             raise ValueError("CI remediation fixtures must have equal byte lengths")
 
-        test_file.write_text(seeded_source)
+        test_file.write_text(CI_SEEDED_SOURCE)
         os.utime(test_file, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
         failing = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
-        test_file.write_text(repaired_source)
+        test_file.write_text(CI_REPAIRED_SOURCE)
         os.utime(test_file, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
         repaired = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
         cache_absent = not (root / "__pycache__").exists()
