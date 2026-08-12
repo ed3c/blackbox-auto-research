@@ -1,0 +1,116 @@
+name: live-git-workspace-evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.context.outputs.artifact_name }}
+      runner_os: ${{ steps.context.outputs.runner_os }}
+      runner_arch: ${{ steps.context.outputs.runner_arch }}
+      runner_image_os: ${{ steps.context.outputs.runner_image_os }}
+      runner_image_version: ${{ steps.context.outputs.runner_image_version }}
+      producer_git_version: ${{ steps.context.outputs.producer_git_version }}
+      producer_python_version: ${{ steps.context.outputs.producer_python_version }}
+    steps:
+      - name: Check out the evidence harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Pin producer context
+        id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ImageOS:?GitHub-hosted runner did not expose ImageOS}"
+          : "${ImageVersion:?GitHub-hosted runner did not expose ImageVersion}"
+          echo "artifact_name=live-git-workspace-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
+          echo "runner_arch=${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+          echo "runner_image_os=${ImageOS}" >> "$GITHUB_OUTPUT"
+          echo "runner_image_version=${ImageVersion}" >> "$GITHUB_OUTPUT"
+          echo "producer_git_version=$(git --version)" >> "$GITHUB_OUTPUT"
+          echo "producer_python_version=$(python3 --version)" >> "$GITHUB_OUTPUT"
+      - name: Provision, repair, capture, and tear down disposable repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/produce_live_git_workspace_evidence.py \
+            --output live-git-workspace-evidence \
+            --workspace "$RUNNER_TEMP/blackbox-disposable-repository" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-commit "$GITHUB_WORKFLOW_SHA" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --runner-image-os "$ImageOS" \
+            --runner-image-version "$ImageVersion"
+      - name: Persist Git workspace evidence outside the producer job
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.context.outputs.artifact_name }}
+          path: live-git-workspace-evidence
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  verify:
+    needs: produce
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the independent verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Retrieve producer evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.produce.outputs.artifact_name }}
+          path: live-git-workspace-evidence
+      - name: Clone, replay, and run planted Git-state tamper probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_live_git_workspace_evidence.py \
+            --input live-git-workspace-evidence \
+            --receipt live-git-workspace-verification/receipt.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-commit "$GITHUB_WORKFLOW_SHA" \
+            --runner-os "${{ needs.produce.outputs.runner_os }}" \
+            --runner-arch "${{ needs.produce.outputs.runner_arch }}" \
+            --runner-image-os "${{ needs.produce.outputs.runner_image_os }}" \
+            --runner-image-version "${{ needs.produce.outputs.runner_image_version }}" \
+            --reported-platform-artifact-digest "${{ needs.produce.outputs.artifact_digest }}" \
+            --expected-producer-git-version "${{ needs.produce.outputs.producer_git_version }}" \
+            --expected-producer-python-version "${{ needs.produce.outputs.producer_python_version }}" \
+            --tamper-probe
+      - name: Persist independent verification receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-git-workspace-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: live-git-workspace-verification/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
