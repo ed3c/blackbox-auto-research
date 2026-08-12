@@ -29,21 +29,31 @@ the artifact from a fresh verifier process.
 
 ```bash
 python3 scripts/run_floci_evidence_store_sandbox.py \
-  --floci-repo /path/to/floci \
-  --receipt /tmp/floci-evidence-store-receipt.json \
+  --floci-repo "$FLOCI_REPO" \
+  --artifacts-dir evidence/floci/floci-sandbox-001 \
+  --receipt evidence/floci/floci-sandbox-001/runner-receipt.json \
   --run-id floci-sandbox-001
 ```
 
 This is an `L2 SANDBOX` compatibility experiment only. Its receipt is hard-coded
 to `provider_kind=floci-emulator`, `maturity=L2 SANDBOX`, and
 `production_claim_allowed=false`. A wrong-secret planted negative that is accepted
-produces a `quarantine` receipt and a non-zero exit code.
+produces a `quarantine` receipt and a non-zero exit code. The artifact directory
+is reserved with exclusive creation and preserves the input payload, IAM policy,
+producer manifest and fresh-process verifier receipt. The final runner receipt is
+written last as the completion marker; failures remove the runner-owned directory.
+The receipt records child locators, SHA-256 digests, sizes and a reproduction
+command whose `FLOCI_REPO` contract is pinned to the source commit and whose
+`NEW_ARTIFACTS_DIR` must not already exist. Read-only evidence replay remains a
+separate #50 requirement and is not claimed by this runner hardening change.
 
-At Floci commit `c21337c3b185ab0c436cdfbc2bede70dadc8330c`, a diagnostic run
-reached S3 write/read, WAL restart and fresh-process retrieval before its combined
-security probe failed. The wrong-secret path was identified as permissive by source
-inspection, but the three-attempt stop-loss prevented a final post-fix receipt.
-Those observations are not a completed qualification or maturity advance.
+The latest execution against commit
+`c21337c3b185ab0c436cdfbc2bede70dadc8330c` again accepted a regular
+Authorization-header request signed with the wrong secret. Its final publication
+then failed closed because the teardown proof parser did not recognize Docker
+29's lower-case `no such object` response. No completed bundle or qualification
+is claimed. The SigV4 enforcement gap remains open as #56, and #50 remains open
+until a new run publishes a complete replayable receipt.
 
 Source inspection also found
 that `FLOCI_AUTH_VALIDATE_SIGNATURES` is consumed for pre-signed URL handling but
