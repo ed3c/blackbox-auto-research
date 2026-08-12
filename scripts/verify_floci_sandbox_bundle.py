@@ -23,6 +23,7 @@ from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
     VERIFICATION_SCHEMA,
     VERIFICATION_LIMITATIONS,
     FlociEnvironment,
+    FlociPhaseTarget,
 )
 from scripts.run_floci_evidence_store_sandbox import (  # noqa: E402
     BASE_VERIFIED_SCOPE,
@@ -223,17 +224,23 @@ def _verify_provenance(
     policy: Mapping[str, object],
 ) -> None:
     environment_value = manifest["environment"]
+    phase_target_value = manifest["phase_target"]
     identities = manifest["identities"]
     _require(isinstance(environment_value, dict), "environment must be an object")
+    _require(isinstance(phase_target_value, dict), "phase target must be an object")
     _require(isinstance(identities, dict), "identities must be an object")
     _require_keys(
         identities,
-        {"task", "candidate", "environment", "harness", "evaluator", "policy"},
+        {
+            "task", "candidate", "environment", "phase_target", "harness",
+            "evaluator", "policy",
+        },
         "identities",
     )
     try:
         environment = FlociEnvironment(**environment_value)
-    except TypeError as error:
+        producer_target = FlociPhaseTarget(**phase_target_value)
+    except (TypeError, ValueError) as error:
         raise ValueError(f"environment fields drift: {error}") from error
     expected = {
         "task": _digest_bytes(b"floci-s3-content-addressed-round-trip/v1"),
@@ -242,6 +249,7 @@ def _verify_provenance(
             ROOT / "scripts/produce_floci_evidence_store.py",
         ),
         "environment": environment.digest,
+        "phase_target": producer_target.digest,
         "harness": _digest_files(ROOT / "scripts/run_floci_evidence_store_sandbox.py"),
         "evaluator": _digest_files(
             ROOT / "blackbox_autoresearch/floci_evidence_store.py",
@@ -253,6 +261,10 @@ def _verify_provenance(
     _require(
         verification["environment_digest"] == environment.digest,
         "environment digest mismatch",
+    )
+    _require(
+        verification["producer_phase_target_digest"] == producer_target.digest,
+        "producer phase target digest mismatch",
     )
     _require(
         receipt["source"] == {"kind": "local-clone", "commit": environment.commit},
@@ -324,7 +336,8 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
         manifest,
         {
             "schema", "provider_kind", "maturity", "production_claim_allowed",
-            "run", "environment", "identities", "artifact", "produced_at",
+            "run", "environment", "phase_target", "identities", "artifact",
+            "produced_at",
         },
         "producer manifest",
     )
@@ -335,7 +348,8 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
         {
             "schema", "verified", "provider_kind", "maturity",
             "production_claim_allowed", "run_id", "artifact_digest",
-            "environment_digest", "producer_pid", "verifier_pid",
+            "environment_digest", "producer_phase_target_digest",
+            "verifier_phase_target_digest", "producer_pid", "verifier_pid",
             "process_separation", "local_digest_negative", "limitations",
             "verified_at",
         },
@@ -414,27 +428,34 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
     signature_record = receipt["invalid_signature_probe"]
     sandbox = receipt["sandbox"]
     _require(isinstance(sandbox, dict), "sandbox identity must be an object")
-    _require_keys(
-        sandbox,
-        {
-            "container_id", "producer_endpoint", "verifier_endpoint",
-            "ca_bundle_sha256", "image_id",
-        },
-        "sandbox identity",
-    )
-    _validate_sandbox_endpoint(sandbox["producer_endpoint"])
-    endpoint = _validate_sandbox_endpoint(sandbox["verifier_endpoint"])
-    ca_digest = sandbox["ca_bundle_sha256"]
+    _require_keys(sandbox, {"producer", "verifier"}, "sandbox identity")
+    try:
+        producer_target = FlociPhaseTarget(**sandbox["producer"])
+        verifier_target = FlociPhaseTarget(**sandbox["verifier"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"sandbox phase target drift: {error}") from error
     _require(
-        isinstance(ca_digest, str) and _DIGEST_RE.fullmatch(ca_digest) is not None,
-        "sandbox CA digest is malformed",
+        producer_target.container_id == verifier_target.container_id,
+        "container identity drifted across restart",
     )
-    _require(sandbox["image_id"] == receipt["image_id"], "sandbox image mismatch")
     _require(
-        isinstance(sandbox["container_id"], str)
-        and re.fullmatch(r"[0-9a-f]{64}", sandbox["container_id"]) is not None,
-        "sandbox container identity is malformed",
+        producer_target.image_id == verifier_target.image_id == receipt["image_id"],
+        "sandbox image mismatch",
     )
+    _require(
+        producer_target.ca_bundle_sha256 == verifier_target.ca_bundle_sha256,
+        "sandbox CA identity drifted across restart",
+    )
+    _require(
+        manifest["phase_target"] == sandbox["producer"],
+        "producer phase target mismatch",
+    )
+    _require(
+        verification["verifier_phase_target_digest"] == verifier_target.digest,
+        "verifier phase target digest mismatch",
+    )
+    endpoint = _validate_sandbox_endpoint(verifier_target.endpoint)
+    ca_digest = verifier_target.ca_bundle_sha256
     iam_status, iam_principal = _replay_probe(
         iam_record,
         "s3-delete-object",

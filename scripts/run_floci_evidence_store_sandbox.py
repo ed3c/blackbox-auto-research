@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
     FlociEnvironment,
     FlociEvidenceIdentity,
+    FlociPhaseTarget,
     WORKER_CONFIG_SCHEMA,
 )
 
@@ -49,6 +50,39 @@ _T = TypeVar("_T")
 class AwsProbeOutcome:
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class AwsCredentials:
+    access_key_id: str
+    secret_access_key: str
+    configured_secret_sha256: str
+
+    @classmethod
+    def configured(cls, access_key_id: str, secret_access_key: str) -> "AwsCredentials":
+        if not access_key_id or not secret_access_key:
+            raise ValueError("configured AWS credentials must be non-empty")
+        return cls(access_key_id, secret_access_key, _digest_bytes(secret_access_key.encode()))
+
+    @property
+    def variant(self) -> str:
+        current = _digest_bytes(self.secret_access_key.encode())
+        return "configured-secret" if current == self.configured_secret_sha256 else "wrong-secret"
+
+    def wrong_secret(self) -> "AwsCredentials":
+        if self.variant != "configured-secret":
+            raise ValueError("wrong-secret credentials require a configured baseline")
+        return AwsCredentials(
+            self.access_key_id,
+            self.secret_access_key + "-wrong",
+            self.configured_secret_sha256,
+        )
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "AWS_ACCESS_KEY_ID": self.access_key_id,
+            "AWS_SECRET_ACCESS_KEY": self.secret_access_key,
+        }
 
 
 @dataclass(frozen=True)
@@ -227,14 +261,13 @@ def _wait_container_ready(name: str, endpoint: str, ca_bundle: Path) -> None:
 def _aws(
     endpoint: str,
     ca_bundle: Path,
-    credentials: dict[str, str],
+    credentials: AwsCredentials,
     *args: str,
     check: bool = True,
-    credential_variant: str = "configured-secret",
 ) -> AwsExecution:
     environment = {
         **os.environ,
-        **credentials,
+        **credentials.environment(),
         "AWS_DEFAULT_REGION": "us-east-1",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_PAGER": "",
@@ -255,9 +288,9 @@ def _aws(
         endpoint=endpoint,
         ca_bundle_sha256=_digest_bytes(ca_bundle.read_bytes()),
         principal_access_key_sha256=_digest_bytes(
-            credentials["AWS_ACCESS_KEY_ID"].encode()
+            credentials.access_key_id.encode()
         ),
-        credential_variant=credential_variant,
+        credential_variant=credentials.variant,
     )
 
 
@@ -268,11 +301,20 @@ def _container_endpoint(name: str) -> str:
     return "https://127.0.0.1:" + mapping[0].rsplit(":", 1)[1]
 
 
-def _container_id(name: str) -> str:
-    value = _run("docker", "inspect", name, "--format", "{{.Id}}", cwd=ROOT).stdout.strip()
-    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise RuntimeError("Floci container identity is malformed")
-    return value
+def _container_target(
+    name: str, endpoint: str, ca_bundle: Path, expected_image_id: str
+) -> FlociPhaseTarget:
+    value = _run(
+        "docker", "inspect", name, "--format", "{{.Id}} {{.Image}}", cwd=ROOT
+    ).stdout.strip().split()
+    if len(value) != 2 or value[1] != expected_image_id:
+        raise RuntimeError("Floci container/image identity drift")
+    return FlociPhaseTarget(
+        container_id=value[0],
+        image_id=value[1],
+        endpoint=endpoint,
+        ca_bundle_sha256=_digest_bytes(ca_bundle.read_bytes()),
+    )
 
 
 def _create_container(name: str, image_id: str, data_dir: Path | str) -> None:
@@ -373,8 +415,8 @@ def _iam_policy(bucket: str) -> dict[str, object]:
     }
 
 
-def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
-    bootstrap = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[AwsCredentials, dict[str, object]]:
+    bootstrap = AwsCredentials.configured("test", "test")
     username = "blackbox-evidence-writer"
     _aws(endpoint, ca_bundle, bootstrap, "iam", "create-user", "--user-name", username)
     policy = _iam_policy(bucket)
@@ -403,10 +445,9 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
         "json",
     )
     access = json.loads(created.result.stdout)["AccessKey"]
-    credentials = {
-        "AWS_ACCESS_KEY_ID": access["AccessKeyId"],
-        "AWS_SECRET_ACCESS_KEY": access["SecretAccessKey"],
-    }
+    credentials = AwsCredentials.configured(
+        access["AccessKeyId"], access["SecretAccessKey"]
+    )
     return credentials, policy
 
 
@@ -471,7 +512,8 @@ def _execute(
     signature_probe_receipt: dict[str, object] | None = None
     restart_receipt: dict[str, object] | None = None
     policy: dict[str, object] = {}
-    sandbox: dict[str, str] | None = None
+    producer_phase_target: FlociPhaseTarget | None = None
+    verifier_phase_target: FlociPhaseTarget | None = None
     with tempfile.TemporaryDirectory(prefix="blackbox-floci-") as temporary:
         runtime = Path(temporary)
         data_dir = runtime / "data"
@@ -484,13 +526,9 @@ def _execute(
             container_created = True
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
-            sandbox = {
-                "container_id": _container_id(container_name),
-                "producer_endpoint": endpoint,
-                "verifier_endpoint": "not-run",
-                "ca_bundle_sha256": _digest_bytes(ca_bundle.read_bytes()),
-                "image_id": image_id,
-            }
+            producer_phase_target = _container_target(
+                container_name, endpoint, ca_bundle, image_id
+            )
             print("bootstrapping restricted IAM principal", flush=True)
             credentials, policy = _bootstrap_iam(endpoint, ca_bundle, f"evidence-{commit[:12]}")
             identity = FlociEvidenceIdentity(
@@ -514,6 +552,8 @@ def _execute(
                 "region": "us-east-1",
                 "ca_bundle": str(ca_bundle),
                 "environment": environment.__dict__,
+                "producer_phase_target": producer_phase_target.__dict__,
+                "phase_target": producer_phase_target.__dict__,
                 "identity": identity.__dict__,
             }
             config_path = runtime / "config.json"
@@ -532,7 +572,7 @@ def _execute(
                 },
             )
             _write_json(policy_path, policy)
-            worker_env = {**os.environ, **credentials}
+            worker_env = {**os.environ, **credentials.environment()}
             _run(
                 sys.executable,
                 str(ROOT / "scripts" / "produce_floci_evidence_store.py"),
@@ -550,8 +590,14 @@ def _execute(
             restarted = _run("docker", "start", container_name, cwd=ROOT)
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
-            sandbox["verifier_endpoint"] = endpoint
-            verifier_config = {**config, "endpoint": endpoint}
+            verifier_phase_target = _container_target(
+                container_name, endpoint, ca_bundle, image_id
+            )
+            verifier_config = {
+                **config,
+                "endpoint": endpoint,
+                "phase_target": verifier_phase_target.__dict__,
+            }
             verifier_config_path = runtime / "verifier-config.json"
             _write_json(verifier_config_path, verifier_config)
             _run(
@@ -595,10 +641,7 @@ def _execute(
                 iam_probe,
             )
             iam_delete_denied = iam_probe.status == "denied"
-            wrong_credentials = {
-                "AWS_ACCESS_KEY_ID": credentials["AWS_ACCESS_KEY_ID"],
-                "AWS_SECRET_ACCESS_KEY": credentials["AWS_SECRET_ACCESS_KEY"] + "-wrong",
-            }
+            wrong_credentials = credentials.wrong_secret()
             bad_signature = _aws(
                 endpoint,
                 ca_bundle,
@@ -610,7 +653,6 @@ def _execute(
                 "--key",
                 key,
                 check=False,
-                credential_variant="wrong-secret",
             )
             signature_probe = _evaluate_aws_probe(
                 bad_signature.result,
@@ -643,7 +685,8 @@ def _execute(
         or evidence_artifacts is None
         or iam_probe_receipt is None
         or signature_probe_receipt is None
-        or sandbox is None
+        or producer_phase_target is None
+        or verifier_phase_target is None
         or restart_receipt is None
         or teardown.status != "container-absent"
     ):
@@ -665,7 +708,10 @@ def _execute(
         "finished_at": finished_at,
         "source": {"kind": "local-clone", "commit": commit},
         "image_id": image_id,
-        "sandbox": sandbox,
+        "sandbox": {
+            "producer": producer_phase_target.__dict__,
+            "verifier": verifier_phase_target.__dict__,
+        },
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
         "sigv4_configuration": "enabled",

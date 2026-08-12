@@ -11,15 +11,16 @@ from pathlib import Path
 import re
 import ssl
 from typing import Callable, Mapping
+from urllib.parse import urlparse
 
 from .evidence_lake import BlobStore, S3CompatibleBlobStore
 
 
-EVIDENCE_SCHEMA = "blackbox-floci-evidence-store/v1"
-VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v2"
+EVIDENCE_SCHEMA = "blackbox-floci-evidence-store/v2"
+VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v3"
 PROVIDER_KIND = "floci-emulator"
 MATURITY = "L2 SANDBOX"
-WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v1"
+WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v2"
 VERIFICATION_LIMITATIONS = (
     "Floci is a local AWS emulator, not a production object store",
     "configured emulator controls require planted-negative outcome verification",
@@ -92,6 +93,37 @@ class FlociEnvironment:
 
 
 @dataclass(frozen=True)
+class FlociPhaseTarget:
+    container_id: str
+    image_id: str
+    endpoint: str
+    ca_bundle_sha256: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", self.container_id) is None:
+            raise ValueError("Floci container_id must be 64 lowercase hex chars")
+        _require_digest(self.image_id, "Floci phase image_id")
+        parsed = urlparse(self.endpoint)
+        if not (
+            parsed.scheme == "https"
+            and parsed.hostname == "127.0.0.1"
+            and parsed.port is not None
+            and parsed.path == ""
+            and parsed.params == ""
+            and parsed.query == ""
+            and parsed.fragment == ""
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            raise ValueError("Floci phase endpoint must be loopback HTTPS")
+        _require_digest(self.ca_bundle_sha256, "Floci phase CA bundle")
+
+    @property
+    def digest(self) -> str:
+        return _digest(_canonical(asdict(self)))
+
+
+@dataclass(frozen=True)
 class FlociEvidenceIdentity:
     run_id: str
     task_digest: str
@@ -112,11 +144,14 @@ class FlociEvidenceIdentity:
         ):
             _require_digest(getattr(self, name), name)
 
-    def manifest_identities(self, environment: FlociEnvironment) -> dict[str, str]:
+    def manifest_identities(
+        self, environment: FlociEnvironment, phase_target: FlociPhaseTarget
+    ) -> dict[str, str]:
         return {
             "task": self.task_digest,
             "candidate": self.candidate_digest,
             "environment": environment.digest,
+            "phase_target": phase_target.digest,
             "harness": self.harness_digest,
             "evaluator": self.evaluator_digest,
             "policy": self.policy_digest,
@@ -130,6 +165,8 @@ class FlociWorkerConfig:
     region: str
     ca_bundle: Path
     environment: FlociEnvironment
+    producer_phase_target: FlociPhaseTarget
+    phase_target: FlociPhaseTarget
     identity: FlociEvidenceIdentity
 
     @classmethod
@@ -142,12 +179,19 @@ class FlociWorkerConfig:
             raise ValueError("worker config must be an object")
         _require_exact_keys(
             value,
-            {"schema", "endpoint", "bucket", "region", "ca_bundle", "environment", "identity"},
+            {
+                "schema", "endpoint", "bucket", "region", "ca_bundle", "environment",
+                "producer_phase_target", "phase_target", "identity",
+            },
             "worker config",
         )
         if value.get("schema") != WORKER_CONFIG_SCHEMA:
             raise ValueError("worker config schema mismatch")
         environment = _require_mapping(value.get("environment"), "environment")
+        producer_phase_target = _require_mapping(
+            value.get("producer_phase_target"), "producer_phase_target"
+        )
+        phase_target = _require_mapping(value.get("phase_target"), "phase_target")
         identity = _require_mapping(value.get("identity"), "identity")
         try:
             result = cls(
@@ -156,12 +200,28 @@ class FlociWorkerConfig:
                 region=str(value["region"]),
                 ca_bundle=Path(str(value["ca_bundle"])),
                 environment=FlociEnvironment(**environment),
+                producer_phase_target=FlociPhaseTarget(**producer_phase_target),
+                phase_target=FlociPhaseTarget(**phase_target),
                 identity=FlociEvidenceIdentity(**identity),
             )
         except TypeError as exc:
             raise ValueError(f"worker config fields drift: {exc}") from exc
         if not result.ca_bundle.is_file() or result.ca_bundle.is_symlink():
             raise ValueError("worker CA bundle must be a regular file")
+        if result.endpoint != result.phase_target.endpoint:
+            raise ValueError("worker endpoint does not match current phase target")
+        if result.environment.image_id != result.phase_target.image_id:
+            raise ValueError("worker image does not match current phase target")
+        if (
+            result.producer_phase_target.container_id
+            != result.phase_target.container_id
+            or result.producer_phase_target.image_id != result.phase_target.image_id
+            or result.producer_phase_target.ca_bundle_sha256
+            != result.phase_target.ca_bundle_sha256
+        ):
+            raise ValueError("worker phase target identity drift")
+        if _digest(result.ca_bundle.read_bytes()) != result.phase_target.ca_bundle_sha256:
+            raise ValueError("worker CA bundle digest mismatch")
         return result
 
     def store(self, environ: Mapping[str, str] | None = None) -> S3CompatibleBlobStore:
@@ -187,6 +247,7 @@ def produce_floci_evidence(
     payload: bytes,
     *,
     environment: FlociEnvironment,
+    phase_target: FlociPhaseTarget,
     identity: FlociEvidenceIdentity,
     producer_pid: int | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -204,7 +265,8 @@ def produce_floci_evidence(
         "production_claim_allowed": False,
         "run": {"run_id": identity.run_id, "producer_pid": process_id},
         "environment": asdict(environment),
-        "identities": identity.manifest_identities(environment),
+        "phase_target": asdict(phase_target),
+        "identities": identity.manifest_identities(environment, phase_target),
         "artifact": {"digest": artifact.digest, "size": artifact.size},
         "produced_at": _timestamp(clock or (lambda: datetime.now(timezone.utc))),
     }
@@ -226,6 +288,8 @@ def verify_floci_evidence(
     manifest: Mapping[str, object],
     *,
     expected_environment: FlociEnvironment,
+    expected_producer_phase_target: FlociPhaseTarget,
+    verifier_phase_target: FlociPhaseTarget,
     expected_identity: FlociEvidenceIdentity,
     verifier_pid: int | None = None,
     run_planted_negative: bool = False,
@@ -240,6 +304,7 @@ def verify_floci_evidence(
             "production_claim_allowed",
             "run",
             "environment",
+            "phase_target",
             "identities",
             "artifact",
             "produced_at",
@@ -263,7 +328,11 @@ def verify_floci_evidence(
         raise ValueError("produced_at is later than verification time")
     if manifest.get("environment") != asdict(expected_environment):
         raise ValueError("Floci environment identity drift")
-    if manifest.get("identities") != expected_identity.manifest_identities(expected_environment):
+    if manifest.get("phase_target") != asdict(expected_producer_phase_target):
+        raise ValueError("Floci producer phase target drift")
+    if manifest.get("identities") != expected_identity.manifest_identities(
+        expected_environment, expected_producer_phase_target
+    ):
         raise ValueError("evidence identities drift")
 
     run = _require_mapping(manifest.get("run"), "run")
@@ -305,6 +374,8 @@ def verify_floci_evidence(
         "run_id": expected_identity.run_id,
         "artifact_digest": digest,
         "environment_digest": expected_environment.digest,
+        "producer_phase_target_digest": expected_producer_phase_target.digest,
+        "verifier_phase_target_digest": verifier_phase_target.digest,
         "producer_pid": producer_pid,
         "verifier_pid": process_id,
         "process_separation": "verified",

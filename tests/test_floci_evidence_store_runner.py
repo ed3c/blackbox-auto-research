@@ -9,6 +9,7 @@ from unittest.mock import patch
 from blackbox_autoresearch.floci_evidence_store import VERIFICATION_SCHEMA
 from scripts.run_floci_evidence_store_sandbox import (
     RUN_SCHEMA,
+    AwsCredentials,
     AwsProbeOutcome,
     _create_container,
     _aws,
@@ -28,7 +29,7 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
         self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v3")
         self.assertEqual(
             VERIFICATION_SCHEMA,
-            "blackbox-floci-evidence-store-verification/v2",
+            "blackbox-floci-evidence-store-verification/v3",
         )
 
     def test_aws_probe_only_accepts_explicit_expected_service_error(self):
@@ -199,9 +200,8 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
                 execution = _aws(
                     "https://127.0.0.1:4566",
                     ca_bundle,
-                    {"AWS_ACCESS_KEY_ID": "fixture-key", "AWS_SECRET_ACCESS_KEY": "wrong"},
+                    AwsCredentials.configured("fixture-key", "configured").wrong_secret(),
                     "s3api", "delete-object",
-                    credential_variant="wrong-secret",
                 )
         outcome = _evaluate_aws_probe(execution.result, {"AccessDenied"})
 
@@ -225,6 +225,16 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
                 "outcome": {"status": "denied", "detail": "AccessDenied"},
             },
         )
+
+    def test_wrong_secret_variant_is_derived_from_a_configured_baseline(self):
+        configured = AwsCredentials.configured("fixture-key", "fixture-secret")
+        wrong = configured.wrong_secret()
+
+        self.assertEqual(wrong.access_key_id, configured.access_key_id)
+        self.assertNotEqual(wrong.secret_access_key, configured.secret_access_key)
+        self.assertEqual(wrong.variant, "wrong-secret")
+        with self.assertRaisesRegex(ValueError, "configured baseline"):
+            wrong.wrong_secret()
 
     def test_reproduction_command_requires_a_new_artifact_directory(self):
         metadata = _reproduction_metadata("a" * 40, "floci-sandbox-example")

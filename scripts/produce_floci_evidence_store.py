@@ -33,6 +33,7 @@ def main() -> int:
         store,
         payload,
         environment=config.environment,
+        phase_target=config.phase_target,
         identity=config.identity,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

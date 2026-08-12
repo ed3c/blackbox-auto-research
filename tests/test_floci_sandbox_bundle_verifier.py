@@ -51,6 +51,13 @@ def build_quarantine_bundle(root: Path) -> Path:
         "iam_enforcement": True,
     }
     environment_digest = digest_bytes(canonical(environment))
+    producer_target = {
+        "container_id": "c" * 64,
+        "image_id": image_id,
+        "endpoint": "https://127.0.0.1:4565",
+        "ca_bundle_sha256": digest_bytes(b"fixture-ca"),
+    }
+    verifier_target = {**producer_target, "endpoint": "https://127.0.0.1:4566"}
     bucket = "evidence-aaaaaaaaaaaa"
     policy = _iam_policy(bucket)
     payload = {
@@ -67,6 +74,7 @@ def build_quarantine_bundle(root: Path) -> Path:
             ROOT / "scripts/produce_floci_evidence_store.py",
         ),
         "environment": environment_digest,
+        "phase_target": digest_bytes(canonical(producer_target)),
         "harness": digest_files(ROOT / "scripts/run_floci_evidence_store_sandbox.py"),
         "evaluator": digest_files(
             ROOT / "blackbox_autoresearch/floci_evidence_store.py",
@@ -75,18 +83,19 @@ def build_quarantine_bundle(root: Path) -> Path:
         "policy": digest_bytes(canonical(policy)),
     }
     manifest = {
-        "schema": "blackbox-floci-evidence-store/v1",
+        "schema": "blackbox-floci-evidence-store/v2",
         "provider_kind": "floci-emulator",
         "maturity": "L2 SANDBOX",
         "production_claim_allowed": False,
         "run": {"run_id": run_id, "producer_pid": 101},
         "environment": environment,
+        "phase_target": producer_target,
         "identities": identities,
         "artifact": {"digest": digest_bytes(payload_bytes), "size": len(payload_bytes)},
         "produced_at": "2026-08-12T00:00:01+00:00",
     }
     verification = {
-        "schema": "blackbox-floci-evidence-store-verification/v2",
+        "schema": "blackbox-floci-evidence-store-verification/v3",
         "verified": True,
         "provider_kind": "floci-emulator",
         "maturity": "L2 SANDBOX",
@@ -94,6 +103,8 @@ def build_quarantine_bundle(root: Path) -> Path:
         "run_id": run_id,
         "artifact_digest": digest_bytes(payload_bytes),
         "environment_digest": environment_digest,
+        "producer_phase_target_digest": digest_bytes(canonical(producer_target)),
+        "verifier_phase_target_digest": digest_bytes(canonical(verifier_target)),
         "producer_pid": 101,
         "verifier_pid": 102,
         "process_separation": "verified",
@@ -138,11 +149,8 @@ def build_quarantine_bundle(root: Path) -> Path:
         "source": {"kind": "local-clone", "commit": commit},
         "image_id": image_id,
         "sandbox": {
-            "container_id": "c" * 64,
-            "producer_endpoint": "https://127.0.0.1:4565",
-            "verifier_endpoint": endpoint,
-            "ca_bundle_sha256": digest_bytes(b"fixture-ca"),
-            "image_id": image_id,
+            "producer": producer_target,
+            "verifier": verifier_target,
         },
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
@@ -241,13 +249,13 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
     def test_replays_the_committed_quarantine_bundle(self) -> None:
         receipt = (
             ROOT
-            / "evidence/floci/floci-sandbox-20260812-07/runner-receipt.json"
+            / "evidence/floci/floci-sandbox-20260812-09/runner-receipt.json"
         )
 
         result = self.run_verifier(receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"run_id": "floci-sandbox-20260812-07"', result.stdout)
+        self.assertIn('"run_id": "floci-sandbox-20260812-09"', result.stdout)
         self.assertIn('"decision": "quarantine"', result.stdout)
 
     def test_rejects_a_tampered_child_before_semantic_replay(self) -> None:
@@ -324,6 +332,33 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("sandbox endpoint mismatch", result.stderr)
+
+    def test_rejects_a_fresh_verifier_receipt_spliced_from_another_container(self) -> None:
+        with self.temporary_directory() as raw:
+            root = Path(raw)
+            receipt_path = build_quarantine_bundle(root)
+            receipt = json.loads(receipt_path.read_bytes())
+            verification_path = root / "verifier-receipt.json"
+            verification = json.loads(verification_path.read_bytes())
+            foreign_target = {
+                **receipt["sandbox"]["verifier"],
+                "container_id": "d" * 64,
+            }
+            receipt["sandbox"]["verifier"] = foreign_target
+            verification["verifier_phase_target_digest"] = digest_bytes(
+                canonical(foreign_target)
+            )
+            verification_bytes = write_json(verification_path, verification)
+            receipt["verification"] = verification
+            receipt["evidence_artifacts"]["verifier_receipt"].update(
+                sha256=digest_bytes(verification_bytes), size=len(verification_bytes)
+            )
+            write_json(receipt_path, receipt)
+
+            result = self.run_verifier(receipt_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("container identity drifted across restart", result.stderr)
 
     def test_rejects_policy_semantic_drift_even_when_digests_are_updated(self) -> None:
         with self.temporary_directory() as raw:
