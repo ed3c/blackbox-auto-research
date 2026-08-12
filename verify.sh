@@ -9,4 +9,5 @@ if python3 "$ROOT/scripts/check_experiment_ledger.py" "$ROOT/tests/fixtures/ledg
   exit 2
 fi
 python3 "$ROOT/scripts/check_public_surface.py" "$ROOT"
+python3 "$ROOT/scripts/gates/check_delivery_receipt.py"
 echo "VERIFY PASS"

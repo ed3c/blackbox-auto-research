@@ -1,0 +1,12 @@
+{
+  "_note": "Tracking-only Forgejo projection receipt. Live issue state is verified explicitly and is not inferred from this zero-network receipt.",
+  "line": "v1-evidence-lake",
+  "repo": "neon/blackbox-auto-research",
+  "issues": [
+    "http://localhost:3000/neon/blackbox-auto-research/issues/8"
+  ],
+  "pr": "not-applicable-tracking-only",
+  "milestone_url": "http://localhost:3000/neon/blackbox-auto-research/milestone/3",
+  "plan_doc": "docs/INTEGRATION_ROADMAP.md",
+  "synced_at_commit": "fe86e1a8bc96ca9c70e13038c1cd9801fae958aa"
+}
