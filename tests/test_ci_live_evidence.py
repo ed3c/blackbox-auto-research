@@ -206,7 +206,7 @@ class CILiveEvidenceTests(unittest.TestCase):
     def test_workflow_pins_actions_and_separates_verifier_job(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "live-ci-evidence.yml").read_text()
         artifact_actions = re.findall(
-            r"uses:\s+(actions/(?:upload|download)-artifact@\S+)", workflow
+            r"(?m)^\s*uses:\s+(actions/(?:upload|download)-artifact@\S+)", workflow
         )
 
         self.assertIn("workflow_dispatch:", workflow)
@@ -218,6 +218,13 @@ class CILiveEvidenceTests(unittest.TestCase):
                 "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
                 "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
             ],
+        )
+        self.assertEqual(
+            re.findall(
+                r"(?m)^\s*uses:\s+(actions/(?:upload|download)-artifact@\S+)",
+                "# uses: actions/upload-artifact@not-a-step",
+            ),
+            [],
         )
         self.assertIn("--tamper-probe", workflow)
 
