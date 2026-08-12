@@ -108,6 +108,19 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("receipt-field-missing", result.stderr)
 
+    def test_receipt_rejects_cross_forge_urls(self) -> None:
+        registry = {
+            "required_receipt_fields": ["line", "issues"],
+            "lines": [{"line": "evidence-lake", "materialized_path": "."}],
+        }
+        receipt = {
+            "line": "evidence-lake",
+            "issues": ["https://github.com/example/project/issues/25"],
+        }
+        result = self.run_gate(registry, receipt)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cross-forge-receipt", result.stderr)
+
     def test_missing_materialized_path_fails_loudly(self) -> None:
         registry = {
             "required_receipt_fields": ["line"],

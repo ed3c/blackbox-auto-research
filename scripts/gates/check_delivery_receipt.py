@@ -116,6 +116,10 @@ def validate(root: Path) -> list[str]:
         except ValueError as error:
             failures.append(f"receipt-invalid: {line_id}: {error}")
             continue
+        for invalid_url in invalid_forge_urls(receipt):
+            failures.append(
+                f"cross-forge-receipt: {line_id}: contains non-local URL: {invalid_url}"
+            )
         for field in required:
             if receipt.get(field) in (None, "", []):
                 failures.append(f"receipt-field-missing: {line_id}: {field}")
