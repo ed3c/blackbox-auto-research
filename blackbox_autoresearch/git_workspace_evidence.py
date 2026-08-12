@@ -392,7 +392,8 @@ def verify_git_workspace_evidence(
             raise EvidenceVerificationError(f"{key} mismatch")
     if evidence["candidate_digest"] != identities["candidate"]:
         raise EvidenceVerificationError("candidate identity does not match candidate bytes")
-    if outcome.get("seeded_test_returncode") != 1 or outcome.get("repaired_test_returncode") != 0:
+    return_codes = (outcome.get("seeded_test_returncode"), outcome.get("repaired_test_returncode"))
+    if any(type(value) is not int for value in return_codes) or return_codes != (1, 0):
         raise EvidenceVerificationError("red/green transition is not proven")
     for name in ("initial_head", "final_head"):
         if not isinstance(outcome.get(name), str) or not _COMMIT_RE.fullmatch(outcome[name]):

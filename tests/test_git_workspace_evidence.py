@@ -200,6 +200,23 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceVerificationError, "manifest keys drift"):
             self.verify(bundle)
 
+    def test_boolean_return_codes_fail_closed(self) -> None:
+        bundle = self.produce()
+        outcome_path = bundle / "outcome.json"
+        outcome = json.loads(outcome_path.read_text())
+        outcome["seeded_test_returncode"] = True
+        outcome["repaired_test_returncode"] = False
+        outcome_path.write_text(json.dumps(outcome, sort_keys=True, separators=(",", ":")) + "\n")
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["outcome_digest"] = (
+            "sha256:" + hashlib.sha256(outcome_path.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "red/green transition"):
+            self.verify(bundle)
+
     def test_context_drift_fails_closed(self) -> None:
         bundle = self.produce()
         drifted = EvidenceContext(**{**self.context.__dict__, "run_id": "999"})
