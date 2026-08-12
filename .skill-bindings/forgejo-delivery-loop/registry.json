@@ -24,10 +24,12 @@
       "materialized_path": ".",
       "plan_doc": "docs/INTEGRATION_ROADMAP.md",
       "issue_urls": [
-        "http://localhost:3000/neon/blackbox-auto-research/issues/8"
+        "http://localhost:3000/neon/blackbox-auto-research/issues/8",
+        "http://localhost:3000/neon/blackbox-auto-research/issues/17",
+        "http://localhost:3000/neon/blackbox-auto-research/issues/18"
       ],
       "pr_urls": [],
-      "note": "Forgejo is a tracking-only projection. Git commits, GitHub issues and evidence remain the source of truth."
+      "note": "Forgejo is a tracking-only projection. Git commits, GitHub issues and evidence remain the source of truth. Issue 17 records a closed GitHub source issue but remains open locally until a typed desired-state closure contract exists."
     }
   ]
 }

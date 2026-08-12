@@ -139,6 +139,31 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("materialized-path-escape", result.stderr)
 
+    def test_repository_receipt_tracks_the_verified_projection(self) -> None:
+        registry = json.loads(
+            (REPO_ROOT / ".skill-bindings/forgejo-delivery-loop/registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        receipt = json.loads(
+            (REPO_ROOT / "delivery.json").read_text(encoding="utf-8")
+        )
+        projected_issues = [
+            "http://localhost:3000/neon/blackbox-auto-research/issues/8",
+            "http://localhost:3000/neon/blackbox-auto-research/issues/17",
+            "http://localhost:3000/neon/blackbox-auto-research/issues/18",
+        ]
+        registry_line = next(
+            line for line in registry["lines"] if line["line"] == receipt["line"]
+        )
+
+        self.assertEqual(registry_line["issue_urls"], projected_issues)
+        self.assertEqual(receipt["issues"], projected_issues)
+        self.assertEqual(
+            receipt["synced_at_commit"],
+            "ae3d988b0c36bd84ded73d21edffb9b85e5ef15e",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

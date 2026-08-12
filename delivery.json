@@ -1,12 +1,14 @@
 {
-  "_note": "Tracking-only Forgejo projection receipt. Live issue state is verified explicitly and is not inferred from this zero-network receipt. The required pr field uses an explicit sentinel because this tracking-only repository has no Git branch or pull-request surface.",
+  "_note": "Tracking-only Forgejo projection receipt. Live issue state is verified explicitly and is not inferred from this zero-network receipt. The required pr field uses an explicit sentinel because this tracking-only repository has no Git branch or pull-request surface. Forgejo issue 17 remains open until a typed desired-state closure contract exists.",
   "line": "v1-evidence-lake",
   "repo": "neon/blackbox-auto-research",
   "issues": [
-    "http://localhost:3000/neon/blackbox-auto-research/issues/8"
+    "http://localhost:3000/neon/blackbox-auto-research/issues/8",
+    "http://localhost:3000/neon/blackbox-auto-research/issues/17",
+    "http://localhost:3000/neon/blackbox-auto-research/issues/18"
   ],
   "pr": "not-applicable-tracking-only",
   "milestone_url": "http://localhost:3000/neon/blackbox-auto-research/milestone/3",
   "plan_doc": "docs/INTEGRATION_ROADMAP.md",
-  "synced_at_commit": "41052a42013435e26999cb1eb5b0d23484f6e750"
+  "synced_at_commit": "ae3d988b0c36bd84ded73d21edffb9b85e5ef15e"
 }
