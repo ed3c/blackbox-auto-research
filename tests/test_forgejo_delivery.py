@@ -84,6 +84,30 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("cross-forge", result.stderr)
 
+    def test_registry_rejects_every_non_local_forge_url(self) -> None:
+        registry = {
+            "required_receipt_fields": ["line"],
+            "lines": [
+                {
+                    "line": "evidence-lake",
+                    "materialized_path": ".",
+                    "issue_urls": ["https://gitlab.com/example/project/-/issues/25"],
+                }
+            ],
+        }
+        result = self.run_gate(registry, {"line": "evidence-lake"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cross-forge", result.stderr)
+
+    def test_receipt_missing_a_required_field_fails(self) -> None:
+        registry = {
+            "required_receipt_fields": ["line", "synced_at_commit"],
+            "lines": [{"line": "evidence-lake", "materialized_path": "."}],
+        }
+        result = self.run_gate(registry, {"line": "evidence-lake"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("receipt-field-missing", result.stderr)
+
     def test_missing_materialized_path_fails_loudly(self) -> None:
         registry = {
             "required_receipt_fields": ["line"],

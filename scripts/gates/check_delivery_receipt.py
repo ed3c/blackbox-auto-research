@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 REGISTRY_REL = Path(".skill-bindings/forgejo-delivery-loop/registry.json")
@@ -35,14 +36,23 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def contains_github(value: Any) -> bool:
+def invalid_forge_urls(value: Any) -> list[str]:
     if isinstance(value, str):
-        return "github.com" in value.lower()
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https"):
+            return []
+        if (
+            parsed.scheme == "http"
+            and parsed.hostname in ("localhost", "127.0.0.1")
+            and parsed.port == 3000
+        ):
+            return []
+        return [value]
     if isinstance(value, list):
-        return any(contains_github(item) for item in value)
+        return [url for item in value for url in invalid_forge_urls(item)]
     if isinstance(value, dict):
-        return any(contains_github(item) for item in value.values())
-    return False
+        return [url for item in value.values() for url in invalid_forge_urls(item)]
+    return []
 
 
 def validate(root: Path) -> list[str]:
@@ -53,8 +63,8 @@ def validate(root: Path) -> list[str]:
         return [f"registry-invalid: {error}"]
 
     failures: list[str] = []
-    if contains_github(registry):
-        failures.append("cross-forge: registry contains github.com")
+    for invalid_url in invalid_forge_urls(registry):
+        failures.append(f"cross-forge: registry contains non-local URL: {invalid_url}")
 
     required = registry.get("required_receipt_fields")
     lines = registry.get("lines")
