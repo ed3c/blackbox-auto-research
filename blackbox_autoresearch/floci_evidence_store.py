@@ -16,7 +16,7 @@ from .evidence_lake import BlobStore, S3CompatibleBlobStore
 
 
 EVIDENCE_SCHEMA = "blackbox-floci-evidence-store/v1"
-VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v1"
+VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v2"
 PROVIDER_KIND = "floci-emulator"
 MATURITY = "L2 SANDBOX"
 WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v1"
@@ -284,12 +284,12 @@ def verify_floci_evidence(
     if len(payload) != size or _digest(payload) != digest:
         raise ValueError("artifact integrity mismatch")
 
-    planted_negative = "not-run"
+    local_digest_negative = "not-run"
     if run_planted_negative:
         mutated = bytes([payload[0] ^ 1]) + payload[1:]
         if _digest(mutated) == digest:
-            raise ValueError("planted artifact mutation was accepted")
-        planted_negative = "rejected"
+            raise ValueError("local digest mutation was not detected")
+        local_digest_negative = "detected"
 
     return {
         "schema": VERIFICATION_SCHEMA,
@@ -303,7 +303,7 @@ def verify_floci_evidence(
         "producer_pid": producer_pid,
         "verifier_pid": process_id,
         "process_separation": "verified",
-        "planted_negative": planted_negative,
+        "local_digest_negative": local_digest_negative,
         "limitations": [
             "Floci is a local AWS emulator, not a production object store",
             "configured emulator controls require planted-negative outcome verification",

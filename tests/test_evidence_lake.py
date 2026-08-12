@@ -146,7 +146,7 @@ class EvidenceLakeTests(unittest.TestCase):
         self.assertEqual(receipt["maturity"], "L2 SANDBOX")
         self.assertFalse(receipt["production_claim_allowed"])
         self.assertEqual(receipt["process_separation"], "verified")
-        self.assertEqual(receipt["planted_negative"], "rejected")
+        self.assertEqual(receipt["local_digest_negative"], "detected")
 
         forged = {**manifest, "maturity": "L4 PRODUCTION"}
         with self.assertRaisesRegex(ValueError, "maturity"):

@@ -11,10 +11,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from typing import Callable, TypeVar
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -28,15 +30,24 @@ from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
 )
 
 
-RUN_SCHEMA = "blackbox-floci-sandbox-run/v1"
+RUN_SCHEMA = "blackbox-floci-sandbox-run/v2"
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _AWS_ERROR_RE = re.compile(r"An error occurred \(([^)]+)\)")
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
 class AwsProbeOutcome:
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class TeardownOutcome:
+    status: str
+    remove_returncode: int
+    inspect_returncode: int
+    inspect_detail: str
 
 
 def _run(
@@ -82,6 +93,93 @@ def _write_json(path: Path, value: object) -> None:
     with path.open("x") as handle:
         json.dump(value, handle, sort_keys=True, separators=(",", ":"))
         handle.write("\n")
+
+
+def _export_evidence_file(source: Path, destination: Path) -> dict[str, object]:
+    if not source.is_file() or source.is_symlink():
+        raise ValueError(f"evidence source must be a regular file: {source.name}")
+    payload = source.read_bytes()
+    with destination.open("xb") as handle:
+        handle.write(payload)
+    return {
+        "locator": destination.name,
+        "sha256": _digest_bytes(payload),
+        "size": len(payload),
+    }
+
+
+def _export_evidence_bundle(
+    artifacts_dir: Path,
+    manifest: Path,
+    verification: Path,
+    payload: Path,
+    policy: Path,
+) -> dict[str, dict[str, object]]:
+    return {
+        "producer_manifest": _export_evidence_file(
+            manifest, artifacts_dir / "producer-manifest.json"
+        ),
+        "verifier_receipt": _export_evidence_file(
+            verification, artifacts_dir / "verifier-receipt.json"
+        ),
+        "input_payload": _export_evidence_file(
+            payload, artifacts_dir / "input-payload.json"
+        ),
+        "iam_policy": _export_evidence_file(policy, artifacts_dir / "iam-policy.json"),
+    }
+
+
+def _validate_output_paths(receipt: Path, artifacts_dir: Path) -> tuple[Path, Path]:
+    resolved_receipt = receipt.resolve()
+    resolved_artifacts = artifacts_dir.resolve()
+    if resolved_receipt.parent != resolved_artifacts:
+        raise ValueError("--receipt must be inside --artifacts-dir")
+    if resolved_receipt.name != "runner-receipt.json":
+        raise ValueError("--receipt filename must be runner-receipt.json")
+    if resolved_artifacts.exists():
+        raise ValueError("artifacts directory already exists")
+    return resolved_receipt, resolved_artifacts
+
+
+def _run_with_artifact_reservation(
+    artifacts_dir: Path, action: Callable[[], _T]
+) -> _T:
+    artifacts_dir.mkdir(parents=True, exist_ok=False)
+    completed = False
+    try:
+        result = action()
+        completed = True
+        return result
+    finally:
+        if not completed:
+            shutil.rmtree(artifacts_dir)
+
+
+def _reproduction_metadata(commit: str, run_id: str) -> dict[str, object]:
+    return {
+        "reproduction_command": [
+            "python3",
+            "scripts/run_floci_evidence_store_sandbox.py",
+            "--floci-repo",
+            "$FLOCI_REPO",
+            "--artifacts-dir",
+            "$NEW_ARTIFACTS_DIR",
+            "--receipt",
+            "$NEW_ARTIFACTS_DIR/runner-receipt.json",
+            "--run-id",
+            run_id,
+        ],
+        "reproduction_environment": {
+            "FLOCI_REPO": {
+                "required": True,
+                "source_commit": commit,
+            },
+            "NEW_ARTIFACTS_DIR": {
+                "required": True,
+                "must_not_exist": True,
+            },
+        },
+    }
 
 
 def _wait_ready(endpoint: str, ca_bundle: Path, *, timeout: float = 90) -> None:
@@ -186,6 +284,38 @@ def _security_decision(iam_probe: AwsProbeOutcome, signature_probe: AwsProbeOutc
     return "pass" if iam_probe.status == signature_probe.status == "denied" else "quarantine"
 
 
+def _probe_receipt(
+    operation: str,
+    result: subprocess.CompletedProcess[str],
+    outcome: AwsProbeOutcome,
+) -> dict[str, object]:
+    return {
+        "operation": operation,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "outcome": outcome.__dict__,
+    }
+
+
+def _evaluate_teardown(
+    removed: subprocess.CompletedProcess[str],
+    inspected: subprocess.CompletedProcess[str],
+) -> TeardownOutcome:
+    inspect_output = (inspected.stdout + inspected.stderr).strip()
+    absent = (
+        removed.returncode == 0
+        and inspected.returncode != 0
+        and "no such object" in inspect_output.lower()
+    )
+    return TeardownOutcome(
+        status="container-absent" if absent else "failed",
+        remove_returncode=removed.returncode,
+        inspect_returncode=inspected.returncode,
+        inspect_detail=inspect_output,
+    )
+
+
 def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
     bootstrap = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
     username = "blackbox-evidence-writer"
@@ -236,13 +366,15 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run the Floci evidence-store L2 SANDBOX experiment")
     value.add_argument("--floci-repo", type=Path, required=True)
+    value.add_argument("--artifacts-dir", type=Path, required=True)
     value.add_argument("--receipt", type=Path, required=True)
     value.add_argument("--run-id", required=True)
     return value
 
 
-def main() -> int:
-    args = parser().parse_args()
+def _execute(
+    args: argparse.Namespace, receipt_path: Path, artifacts_dir: Path
+) -> int:
     floci_repo = args.floci_repo.resolve()
     if not (floci_repo / "docker" / "Dockerfile").is_file():
         raise ValueError("--floci-repo must point to a Floci source clone")
@@ -280,13 +412,17 @@ def main() -> int:
     )
     container_name = f"blackbox-floci-{os.getpid()}"
     container_created = False
-    teardown = "not-run"
+    teardown = TeardownOutcome("not-run", -1, -1, "not-run")
     started_at = datetime.now(timezone.utc).isoformat()
     verification: dict[str, object] | None = None
+    evidence_artifacts: dict[str, dict[str, object]] | None = None
     iam_delete_denied = False
     invalid_signature_denied = False
     iam_probe = AwsProbeOutcome("not-run", "not-run")
     signature_probe = AwsProbeOutcome("not-run", "not-run")
+    iam_probe_receipt: dict[str, object] | None = None
+    signature_probe_receipt: dict[str, object] | None = None
+    restart_receipt: dict[str, object] | None = None
     policy: dict[str, object] = {}
     with tempfile.TemporaryDirectory(prefix="blackbox-floci-") as temporary:
         runtime = Path(temporary)
@@ -327,6 +463,7 @@ def main() -> int:
             }
             config_path = runtime / "config.json"
             payload_path = runtime / "payload.json"
+            policy_path = runtime / "iam-policy.json"
             manifest_path = runtime / "manifest.json"
             verification_path = runtime / "verification.json"
             _write_json(config_path, config)
@@ -339,6 +476,7 @@ def main() -> int:
                     "reason": "L2 SANDBOX contract probe",
                 },
             )
+            _write_json(policy_path, policy)
             worker_env = {**os.environ, **credentials}
             _run(
                 sys.executable,
@@ -353,8 +491,8 @@ def main() -> int:
                 env=worker_env,
             )
             print("restarting Floci before fresh-process verification", flush=True)
-            _run("docker", "stop", container_name, cwd=ROOT)
-            _run("docker", "start", container_name, cwd=ROOT)
+            stopped = _run("docker", "stop", container_name, cwd=ROOT)
+            restarted = _run("docker", "start", container_name, cwd=ROOT)
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
             verifier_config = {**config, "endpoint": endpoint}
@@ -373,6 +511,11 @@ def main() -> int:
                 cwd=ROOT,
                 env=worker_env,
             )
+            restart_receipt = {
+                "stop_returncode": stopped.returncode,
+                "start_returncode": restarted.returncode,
+                "fresh_verifier": "verified",
+            }
             print("checking IAM deny and invalid-signature paths", flush=True)
             verification = json.loads(verification_path.read_bytes())
             artifact_digest = str(verification["artifact_digest"]).removeprefix("sha256:")
@@ -390,6 +533,7 @@ def main() -> int:
                 check=False,
             )
             iam_probe = _evaluate_aws_probe(denied, {"AccessDenied", "AccessDeniedException"})
+            iam_probe_receipt = _probe_receipt("s3-delete-object", denied, iam_probe)
             iam_delete_denied = iam_probe.status == "denied"
             wrong_credentials = {
                 "AWS_ACCESS_KEY_ID": credentials["AWS_ACCESS_KEY_ID"],
@@ -411,13 +555,34 @@ def main() -> int:
                 bad_signature,
                 {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
             )
+            signature_probe_receipt = _probe_receipt(
+                "s3-head-object-with-wrong-secret", bad_signature, signature_probe
+            )
             invalid_signature_denied = signature_probe.status == "denied"
+            evidence_artifacts = _export_evidence_bundle(
+                artifacts_dir,
+                manifest_path,
+                verification_path,
+                payload_path,
+                policy_path,
+            )
         finally:
             if container_created:
-                _run("docker", "rm", "--force", container_name, cwd=ROOT, check=False)
-                absent = _run("docker", "inspect", container_name, cwd=ROOT, check=False)
-                teardown = "container-absent" if absent.returncode != 0 else "failed"
-    if verification is None or teardown != "container-absent":
+                removed = _run(
+                    "docker", "rm", "--force", container_name, cwd=ROOT, check=False
+                )
+                inspected = _run(
+                    "docker", "inspect", container_name, cwd=ROOT, check=False
+                )
+                teardown = _evaluate_teardown(removed, inspected)
+    if (
+        verification is None
+        or evidence_artifacts is None
+        or iam_probe_receipt is None
+        or signature_probe_receipt is None
+        or restart_receipt is None
+        or teardown.status != "container-absent"
+    ):
         raise RuntimeError("Floci sandbox did not produce verified evidence and teardown")
     finished_at = datetime.now(timezone.utc).isoformat()
     security_decision = _security_decision(iam_probe, signature_probe)
@@ -442,20 +607,21 @@ def main() -> int:
         "sigv4_wrong_secret": signature_probe.status,
         "iam_enforcement": "enabled",
         "security_decision": security_decision,
-        "restart_reverification": "verified",
+        "restart_reverification": restart_receipt,
         "iam_delete_denied": iam_delete_denied,
         "invalid_signature_denied": invalid_signature_denied,
-        "iam_delete_probe": iam_probe.__dict__,
-        "invalid_signature_probe": signature_probe.__dict__,
-        "teardown": teardown,
+        "iam_delete_probe": iam_probe_receipt,
+        "invalid_signature_probe": signature_probe_receipt,
+        "teardown": teardown.__dict__,
         "verification": verification,
+        "evidence_artifacts": evidence_artifacts,
         "limitations": [
             "external production object storage remains unproven",
             "production metadata/index, managed KMS/HSM, backup/restore, and multi-host recovery remain unproven",
         ],
+        **_reproduction_metadata(commit, args.run_id),
     }
-    args.receipt.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(args.receipt, receipt)
+    _write_json(receipt_path, receipt)
     print(
         json.dumps(
             {
@@ -467,6 +633,17 @@ def main() -> int:
         )
     )
     return 0 if security_decision == "pass" else 3
+
+
+def main() -> int:
+    args = parser().parse_args()
+    receipt_path, artifacts_dir = _validate_output_paths(
+        args.receipt, args.artifacts_dir
+    )
+    return _run_with_artifact_reservation(
+        artifacts_dir,
+        lambda: _execute(args, receipt_path, artifacts_dir),
+    )
 
 
 if __name__ == "__main__":
