@@ -27,6 +27,17 @@ Use the existing provider-neutral RunManifest and ResourcePolicy to execute a di
 
 Follow `../EVIDENCE_CONTRACT.md`, plus OpenShell version/runtime identity and policy-enforcement events.
 
+The partial-live evidence harness is intentionally narrower than this contract:
+
+```bash
+python3 scripts/produce_live_openshell_evidence.py --help
+python3 scripts/verify_live_openshell_evidence.py --help
+```
+
+It records real network, filesystem, budget and teardown probes in a content-addressed
+bundle. It must continue to report `credential-broker` and `evaluator-isolation` as
+unproven until those boundaries have their own real evidence.
+
 ## Done
 
 #19 can close only after a real session produces replayable evidence and an independent verifier confirms the expected final state and denied operations.
