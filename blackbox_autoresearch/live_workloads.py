@@ -175,18 +175,35 @@ def run_ci_remediation_workload() -> WorkloadEvidence:
         root = Path(tmp)
         test_file = root / "test_target.py"
         test_command = [sys.executable, "-B", "-m", "unittest", "-q"]
-        test_file.write_text("import unittest\n\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(1 + 1, 3)\n")
-        failing = subprocess.run(test_command, cwd=root, capture_output=True).returncode != 0
-        test_file.write_text("import unittest\n\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(1 + 1, 2)\n")
-        repaired = subprocess.run(test_command, cwd=root, capture_output=True).returncode == 0
+        test_file.write_text(
+            "import unittest\n\nclass T(unittest.TestCase):\n"
+            "    def test_value(self): print('seeded'); self.assertEqual(1 + 1, 3)\n"
+        )
+        failing = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
+        test_file.write_text(
+            "import unittest\n\nclass T(unittest.TestCase):\n"
+            "    def test_value(self): print('repair'); self.assertEqual(1 + 1, 2)\n"
+        )
+        repaired = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
+        cache_absent = not (root / "__pycache__").exists()
         data = test_file.read_bytes()
         return WorkloadEvidence(
             "ci-remediation",
             "seed failing disposable test then repair it",
             sha256_bytes(data),
             "before-fails-after-passes-verifier",
-            failing and repaired,
-            {"seeded_failure": str(failing).lower(), "repaired": str(repaired).lower()},
+            failing.returncode == 1
+            and failing.stdout.splitlines() == ["seeded"]
+            and repaired.returncode == 0
+            and repaired.stdout.splitlines() == ["repair"]
+            and cache_absent,
+            {
+                "bytecode_cache_absent": str(cache_absent).lower(),
+                "repaired": str(repaired.returncode == 0).lower(),
+                "repaired_source": repaired.stdout.strip(),
+                "seeded_failure": str(failing.returncode == 1).lower(),
+                "seeded_source": failing.stdout.strip(),
+            },
         )
 
 

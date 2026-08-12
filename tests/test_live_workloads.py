@@ -32,6 +32,14 @@ class LiveWorkloadTests(unittest.TestCase):
         self.assertEqual("L2_SANDBOX", envelope["maturity"])
         self.assertEqual(5, len(envelope["workloads"]))
 
+    def test_ci_remediation_executes_both_current_sources_without_bytecode_cache(self) -> None:
+        evidence = run_ci_remediation_workload()
+
+        self.assertTrue(evidence.passed, evidence.metadata)
+        self.assertEqual("seeded", evidence.metadata["seeded_source"])
+        self.assertEqual("repair", evidence.metadata["repaired_source"])
+        self.assertEqual("true", evidence.metadata["bytecode_cache_absent"])
+
     def test_differential_verifier_detects_seeded_regression(self) -> None:
         baseline = lambda value: value * 2
         seeded_regression = lambda value: value * 2 + (1 if value == 3 else 0)
