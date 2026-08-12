@@ -1,12 +1,23 @@
 import sqlite3
 import tempfile
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import unittest
 
 from blackbox_autoresearch.evidence_lake import (
+    ArtifactRecord,
     DirectoryBlobStore,
     HMACSigner,
+    S3CompatibleBlobStore,
     SQLiteEvidenceIndex,
+)
+from blackbox_autoresearch.floci_evidence_store import (
+    FlociEvidenceIdentity,
+    FlociEnvironment,
+    produce_floci_evidence,
+    verify_floci_evidence,
 )
 
 
@@ -17,7 +28,149 @@ DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
 
 
+class _S3Handler(BaseHTTPRequestHandler):
+    objects: dict[str, bytes] = {}
+    requests: list[dict[str, str]] = []
+
+    def log_message(self, *_args) -> None:
+        return
+
+    def do_PUT(self) -> None:  # noqa: N802
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.__class__.requests.append(
+            {
+                "authorization": self.headers.get("Authorization", ""),
+                "date": self.headers.get("X-Amz-Date", ""),
+                "if_none_match": self.headers.get("If-None-Match", ""),
+                "path": self.path,
+            }
+        )
+        if self.path == "/evidence":
+            self.send_response(200)
+            self.end_headers()
+            return
+        if self.headers.get("If-None-Match") == "*" and self.path in self.__class__.objects:
+            self.send_response(412)
+            self.end_headers()
+            return
+        self.__class__.objects[self.path] = body
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        body = self.__class__.objects[self.path]
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _S3Server:
+    def __enter__(self) -> str:
+        _S3Handler.objects = {}
+        _S3Handler.requests = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _S3Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def __exit__(self, *_args) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+
+
+class _MemoryBlobStore:
+    def __init__(self) -> None:
+        self.data: dict[str, bytes] = {}
+
+    def put(self, data: bytes) -> ArtifactRecord:
+        digest = S3CompatibleBlobStore.digest(data)
+        self.data[digest] = data
+        return ArtifactRecord(digest, len(data))
+
+    def get(self, digest: str) -> bytes:
+        return self.data[digest]
+
+
 class EvidenceLakeTests(unittest.TestCase):
+    def test_floci_receipt_is_l2_only_and_rejects_a_production_relabel(self):
+        store = _MemoryBlobStore()
+        environment = FlociEnvironment(
+            commit="a" * 40,
+            image_id="sha256:" + "b" * 64,
+            storage_mode="wal",
+            endpoint_scheme="https",
+            tls_trust="pinned-self-signed-certificate",
+            sigv4_validation_configured=True,
+            iam_enforcement=True,
+        )
+        identity = FlociEvidenceIdentity(
+            run_id="floci-sandbox-1",
+            task_digest=DIGEST_A,
+            candidate_digest=DIGEST_B,
+            harness_digest=DIGEST_C,
+            evaluator_digest="sha256:" + "d" * 64,
+            policy_digest="sha256:" + "e" * 64,
+        )
+        manifest = produce_floci_evidence(
+            store,
+            b"verified-outcome",
+            environment=environment,
+            identity=identity,
+            producer_pid=101,
+        )
+        receipt = verify_floci_evidence(
+            store,
+            manifest,
+            expected_environment=environment,
+            expected_identity=identity,
+            verifier_pid=202,
+            run_planted_negative=True,
+        )
+
+        self.assertEqual(receipt["provider_kind"], "floci-emulator")
+        self.assertEqual(receipt["maturity"], "L2 SANDBOX")
+        self.assertFalse(receipt["production_claim_allowed"])
+        self.assertEqual(receipt["process_separation"], "verified")
+        self.assertEqual(receipt["planted_negative"], "rejected")
+
+        forged = {**manifest, "maturity": "L4 PRODUCTION"}
+        with self.assertRaisesRegex(ValueError, "maturity"):
+            verify_floci_evidence(
+                store,
+                forged,
+                expected_environment=environment,
+                expected_identity=identity,
+                verifier_pid=202,
+            )
+
+    def test_s3_compatible_store_round_trips_content_addressed_blob_with_sigv4(self):
+        with _S3Server() as endpoint:
+            store = S3CompatibleBlobStore(
+                endpoint=endpoint,
+                bucket="evidence",
+                region="us-east-1",
+                access_key="sandbox-access",
+                secret_key="sandbox-secret",
+                clock=lambda: datetime(2026, 8, 12, tzinfo=timezone.utc),
+            )
+            store.create_bucket()
+            first = store.put(b"verified-outcome")
+            second = store.put(b"verified-outcome")
+
+            self.assertEqual(first, second)
+            self.assertEqual(store.get(first.digest), b"verified-outcome")
+            object_request = _S3Handler.requests[1]
+            self.assertEqual(object_request["date"], "20260812T000000Z")
+            self.assertEqual(object_request["if_none_match"], "*")
+            self.assertTrue(
+                object_request["authorization"].startswith(
+                    "AWS4-HMAC-SHA256 Credential=sandbox-access/20260812/us-east-1/s3/aws4_request, "
+                )
+            )
+
     def test_fresh_process_style_reopen_verifies_signed_chain_and_blob(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
