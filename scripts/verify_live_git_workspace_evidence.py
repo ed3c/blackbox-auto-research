@@ -18,6 +18,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--input", type=Path, required=True)
     value.add_argument("--receipt", type=Path, required=True)
     value.add_argument("--reported-platform-artifact-digest", required=True)
+    value.add_argument("--expected-producer-git-version", required=True)
+    value.add_argument("--expected-producer-python-version", required=True)
     value.add_argument("--tamper-probe", action="store_true")
     for name in (
         "repository", "run-id", "run-attempt", "source-commit", "workflow-commit",
@@ -41,6 +43,8 @@ def main() -> int:
         evaluator_path=Path(__file__).resolve(),
         policy_path=ROOT / ".github" / "workflows" / "live-git-workspace-evidence.yml",
         reported_platform_artifact_digest=args.reported_platform_artifact_digest,
+        expected_producer_git_version=args.expected_producer_git_version,
+        expected_producer_python_version=args.expected_producer_python_version,
         run_tamper_probe=args.tamper_probe,
     )
     args.receipt.parent.mkdir(parents=True, exist_ok=True)

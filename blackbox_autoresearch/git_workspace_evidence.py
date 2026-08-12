@@ -123,6 +123,8 @@ def produce_git_workspace_evidence(
     evaluator_path: Path,
     policy_path: Path,
 ) -> dict[str, object]:
+    output_dir = output_dir.resolve()
+    workspace = workspace.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     if workspace.exists():
         raise ValueError(f"workspace already exists: {workspace}")
@@ -251,6 +253,7 @@ def _tree(bundle_clone: Path, revision: str) -> dict[str, str]:
 
 
 def _verify_repository(bundle: Path, outcome: dict[str, Any]) -> None:
+    bundle = bundle.resolve()
     heads = _run("git", "bundle", "list-heads", str(bundle), cwd=bundle.parent).stdout.splitlines()
     if heads != [
         f"{outcome.get('final_head')} refs/heads/main",
@@ -313,6 +316,8 @@ def verify_git_workspace_evidence(
     evaluator_path: Path,
     policy_path: Path,
     reported_platform_artifact_digest: str,
+    expected_producer_git_version: str,
+    expected_producer_python_version: str,
     run_tamper_probe: bool = False,
 ) -> dict[str, object]:
     manifest = _read_object(bundle_dir / "manifest.json")
@@ -361,13 +366,13 @@ def verify_git_workspace_evidence(
             raise EvidenceVerificationError(f"{name} must be non-empty")
         if outcome.get(name) != environment[name]:
             raise EvidenceVerificationError(f"{name} outcome drift")
-    observed_versions = {
-        "git_version": _run("git", "--version", cwd=bundle_dir).stdout.strip(),
-        "python_version": _run(sys.executable, "--version", cwd=bundle_dir).stdout.strip(),
+    expected_producer_versions = {
+        "git_version": expected_producer_git_version,
+        "python_version": expected_producer_python_version,
     }
-    for name, observed in observed_versions.items():
-        if environment[name] != observed:
-            raise EvidenceVerificationError(f"{name} runtime drift")
+    for name, expected in expected_producer_versions.items():
+        if environment[name] != expected:
+            raise EvidenceVerificationError(f"{name} producer output drift")
     identities = _require_object(manifest.get("identities"), "identities")
     _require_keys(identities, {"task", "candidate", "environment", "harness", "evaluator", "policy"}, "identities")
     expected_identities = _identity_map(
@@ -424,5 +429,9 @@ def verify_git_workspace_evidence(
         "reported_platform_artifact_digest": "sha256:" + digest,
         "platform_artifact_digest_verified": False,
         "tamper_probe": tamper,
+        "verifier_environment": {
+            "git_version": _run("git", "--version", cwd=bundle_dir).stdout.strip(),
+            "python_version": _run(sys.executable, "--version", cwd=bundle_dir).stdout.strip(),
+        },
         "verified_at": datetime.now(timezone.utc).isoformat(),
     }

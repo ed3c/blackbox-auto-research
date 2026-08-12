@@ -49,10 +49,13 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         return bundle
 
     def verify(self, bundle: Path) -> dict[str, object]:
+        manifest = json.loads((bundle / "manifest.json").read_text())
         return verify_git_workspace_evidence(
             bundle, expected_context=self.context, harness_path=self.harness,
             evaluator_path=self.evaluator, policy_path=self.policy,
             reported_platform_artifact_digest=PLATFORM_DIGEST, run_tamper_probe=True,
+            expected_producer_git_version=manifest["environment"]["git_version"],
+            expected_producer_python_version=manifest["environment"]["python_version"],
         )
 
     def test_replays_git_bundle_and_rejects_planted_tamper(self) -> None:
@@ -67,6 +70,8 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         self.assertTrue(receipt["verified"])
         self.assertEqual(receipt["tamper_probe"], "rejected")
         self.assertEqual(receipt["maturity_decision"], "unassessed")
+        self.assertIn("git_version", receipt["verifier_environment"])
+        self.assertIn("python_version", receipt["verifier_environment"])
 
     def test_repository_bundle_tamper_fails_closed(self) -> None:
         bundle = self.produce()
@@ -109,8 +114,14 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         )
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
 
-        with self.assertRaisesRegex(EvidenceVerificationError, "git_version runtime drift"):
-            self.verify(bundle)
+        with self.assertRaisesRegex(EvidenceVerificationError, "git_version producer output drift"):
+            verify_git_workspace_evidence(
+                bundle, expected_context=self.context, harness_path=self.harness,
+                evaluator_path=self.evaluator, policy_path=self.policy,
+                reported_platform_artifact_digest=PLATFORM_DIGEST,
+                expected_producer_git_version="git version original",
+                expected_producer_python_version=outcome["python_version"],
+            )
 
     def test_repository_bundle_rejects_extra_ref(self) -> None:
         bundle = self.produce()
@@ -198,6 +209,8 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
                 bundle, expected_context=drifted, harness_path=self.harness,
                 evaluator_path=self.evaluator, policy_path=self.policy,
                 reported_platform_artifact_digest=PLATFORM_DIGEST,
+                expected_producer_git_version=json.loads((bundle / "manifest.json").read_text())["environment"]["git_version"],
+                expected_producer_python_version=json.loads((bundle / "manifest.json").read_text())["environment"]["python_version"],
             )
 
     def test_refuses_preexisting_workspace(self) -> None:
@@ -225,15 +238,19 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
             "--runner-image-version", self.context.runner_image_version,
         ]
         subprocess.run(
-            [sys.executable, "scripts/produce_live_git_workspace_evidence.py",
-             "--output", str(bundle), "--workspace", str(workspace), *context_args],
-            cwd=ROOT, check=True, capture_output=True, text=True,
+            [sys.executable, str(ROOT / "scripts/produce_live_git_workspace_evidence.py"),
+             "--output", bundle.name, "--workspace", workspace.name, *context_args],
+            cwd=self.root, check=True, capture_output=True, text=True,
         )
+        produced_manifest = json.loads((bundle / "manifest.json").read_text())
         subprocess.run(
-            [sys.executable, "scripts/verify_live_git_workspace_evidence.py",
-             "--input", str(bundle), "--receipt", str(receipt),
-             "--reported-platform-artifact-digest", PLATFORM_DIGEST, "--tamper-probe", *context_args],
-            cwd=ROOT, check=True, capture_output=True, text=True,
+            [sys.executable, str(ROOT / "scripts/verify_live_git_workspace_evidence.py"),
+             "--input", bundle.name, "--receipt", receipt.name,
+             "--reported-platform-artifact-digest", PLATFORM_DIGEST, "--tamper-probe",
+             "--expected-producer-git-version", produced_manifest["environment"]["git_version"],
+             "--expected-producer-python-version", produced_manifest["environment"]["python_version"],
+             *context_args],
+            cwd=self.root, check=True, capture_output=True, text=True,
         )
 
         self.assertTrue(json.loads(receipt.read_text())["verified"])

@@ -17,6 +17,8 @@ jobs:
       runner_arch: ${{ steps.context.outputs.runner_arch }}
       runner_image_os: ${{ steps.context.outputs.runner_image_os }}
       runner_image_version: ${{ steps.context.outputs.runner_image_version }}
+      producer_git_version: ${{ steps.context.outputs.producer_git_version }}
+      producer_python_version: ${{ steps.context.outputs.producer_python_version }}
     steps:
       - name: Check out the evidence harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,6 +40,8 @@ jobs:
           echo "runner_arch=${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
           echo "runner_image_os=${ImageOS}" >> "$GITHUB_OUTPUT"
           echo "runner_image_version=${ImageVersion}" >> "$GITHUB_OUTPUT"
+          echo "producer_git_version=$(git --version)" >> "$GITHUB_OUTPUT"
+          echo "producer_python_version=$(python3 --version)" >> "$GITHUB_OUTPUT"
       - name: Provision, repair, capture, and tear down disposable repository
         shell: bash
         run: |
@@ -99,6 +103,8 @@ jobs:
             --runner-image-os "${{ needs.produce.outputs.runner_image_os }}" \
             --runner-image-version "${{ needs.produce.outputs.runner_image_version }}" \
             --reported-platform-artifact-digest "${{ needs.produce.outputs.artifact_digest }}" \
+            --expected-producer-git-version "${{ needs.produce.outputs.producer_git_version }}" \
+            --expected-producer-python-version "${{ needs.produce.outputs.producer_python_version }}" \
             --tamper-probe
       - name: Persist independent verification receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
