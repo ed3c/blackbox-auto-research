@@ -170,12 +170,18 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
             receipt["synced_at_commit"],
             "710a944f6a9ae72d3cb88ea54af672d5053f23ff",
         )
-        resolved = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{receipt['synced_at_commit']}^{{commit}}"],
+        commit_object = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "cat-file", "-p", "HEAD"],
             text=True,
             capture_output=True,
         )
-        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(commit_object.returncode, 0, commit_object.stderr)
+        parent_shas = {
+            line.removeprefix("parent ")
+            for line in commit_object.stdout.splitlines()
+            if line.startswith("parent ")
+        }
+        self.assertIn(receipt["synced_at_commit"], parent_shas)
 
     def test_closed_projection_issues_have_typed_live_receipts(self) -> None:
         receipt_dir = (
