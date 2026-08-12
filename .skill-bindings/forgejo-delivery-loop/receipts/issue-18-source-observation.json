@@ -1,0 +1,12 @@
+{
+  "issue_state": "closed",
+  "issue_url": "https://github.com/ed3c/blackbox-auto-research/issues/50",
+  "merge_sha": "ca73dfc0301fd103bbb4ef8ee2ced1f06cdf61f1",
+  "observed_at": "2026-08-12T17:18:22+00:00",
+  "producer": "gh-cli-authenticated-read",
+  "pull_request_state": "merged",
+  "pull_request_url": "https://github.com/ed3c/blackbox-auto-research/pull/58",
+  "request_sha256": "sha256:b7601fc257ec853107c9cf4f3eb29149cbc0ade29cc71453dad716ca47b5455e",
+  "source_observation_sha256": "sha256:988acc2582bb528854ab5849f871e1db2c51ea0d13bd1aa825cf290751987d56",
+  "status": "source-verified"
+}

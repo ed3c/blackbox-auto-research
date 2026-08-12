@@ -1,0 +1,18 @@
+{
+  "closure_actor": "neon",
+  "closure_created_at": "2026-08-13T01:19:24+08:00",
+  "idempotency_marker": "https://github.com/ed3c/blackbox-auto-research/issues/50",
+  "issue_number": 18,
+  "maturity_effect": "tracking-only-no-maturity-change",
+  "observed_at": "2026-08-12T17:43:02+00:00",
+  "post_observation_sha256": "sha256:f5c7ef2b838106cff46a38edba22c51684548079413b2597b8c7d1ac8ef58882",
+  "pre_observation_sha256": "sha256:b7194f19548276f0dc0ce9fb1d57341a0e668c89e391110c87bca657872adb0d",
+  "producer": "forgejo-api-authenticated-read",
+  "repository": "neon/blackbox-auto-research",
+  "request_sha256": "sha256:b7601fc257ec853107c9cf4f3eb29149cbc0ade29cc71453dad716ca47b5455e",
+  "schema_version": "forgejo-issue-state-readback-receipt@v1",
+  "source_merge_sha": "ca73dfc0301fd103bbb4ef8ee2ced1f06cdf61f1",
+  "source_observation_sha256": "sha256:988acc2582bb528854ab5849f871e1db2c51ea0d13bd1aa825cf290751987d56",
+  "state": "closed",
+  "status": "verified"
+}

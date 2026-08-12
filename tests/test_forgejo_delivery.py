@@ -1,7 +1,9 @@
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -10,6 +12,11 @@ GATE = REPO_ROOT / "scripts" / "gates" / "check_delivery_receipt.py"
 
 
 class ForgejoDeliveryGateTests(unittest.TestCase):
+    @staticmethod
+    def digest(value: dict) -> str:
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
     def run_gate(
         self, registry: dict, receipt: dict | None
     ) -> subprocess.CompletedProcess[str]:
@@ -161,8 +168,107 @@ class ForgejoDeliveryGateTests(unittest.TestCase):
         self.assertEqual(receipt["issues"], projected_issues)
         self.assertEqual(
             receipt["synced_at_commit"],
-            "ae3d988b0c36bd84ded73d21edffb9b85e5ef15e",
+            "710a944f6a9ae72d3cb88ea54af672d5053f23ff",
         )
+        resolved = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{receipt['synced_at_commit']}^{{commit}}"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+
+    def test_closed_projection_issues_have_typed_live_receipts(self) -> None:
+        receipt_dir = (
+            REPO_ROOT / ".skill-bindings" / "forgejo-delivery-loop" / "receipts"
+        )
+        expected = {
+            17: "fe86e1a8bc96ca9c70e13038c1cd9801fae958aa",
+            18: "ca73dfc0301fd103bbb4ef8ee2ced1f06cdf61f1",
+        }
+        for issue_number, merge_sha in expected.items():
+            request = json.loads(
+                (receipt_dir / f"issue-{issue_number}-request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            receipt = json.loads(
+                (receipt_dir / f"issue-{issue_number}-receipt.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            source = json.loads(
+                (receipt_dir / f"issue-{issue_number}-source-observation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            pre = json.loads(
+                (receipt_dir / f"issue-{issue_number}-pre-observation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(request["issue_number"], issue_number)
+            self.assertEqual(request["expected_state"], "open")
+            self.assertEqual(request["desired_state"], "closed")
+            self.assertEqual(receipt["schema_version"], "forgejo-issue-state-readback-receipt@v1")
+            self.assertEqual(receipt["status"], "verified")
+            self.assertEqual(receipt["state"], "closed")
+            self.assertEqual(receipt["issue_number"], issue_number)
+            self.assertEqual(receipt["source_merge_sha"], merge_sha)
+            self.assertEqual(
+                receipt["maturity_effect"], "tracking-only-no-maturity-change"
+            )
+            self.assertEqual(receipt["request_sha256"], self.digest(request))
+            self.assertEqual(source["request_sha256"], receipt["request_sha256"])
+            self.assertEqual(pre["request_sha256"], receipt["request_sha256"])
+            self.assertEqual(pre["repository"], receipt["repository"])
+            self.assertEqual(pre["issue_number"], receipt["issue_number"])
+            self.assertEqual(pre["idempotency_marker"], receipt["idempotency_marker"])
+            self.assertEqual(
+                request["source_receipt"]["issue_url"], receipt["idempotency_marker"]
+            )
+            self.assertEqual(
+                source["issue_url"], request["source_receipt"]["issue_url"]
+            )
+            self.assertEqual(
+                source["pull_request_url"],
+                request["source_receipt"]["pull_request_url"],
+            )
+            self.assertEqual(source["merge_sha"], receipt["source_merge_sha"])
+            self.assertEqual(receipt["pre_observation_sha256"], self.digest(pre))
+            source_identity = {
+                field: value
+                for field, value in source.items()
+                if field
+                not in {
+                    "status", "request_sha256", "source_observation_sha256", "observed_at"
+                }
+            }
+            self.assertEqual(
+                receipt["source_observation_sha256"], self.digest(source_identity)
+            )
+            post_identity = {
+                "status": "captured",
+                "schema_version": "forgejo-issue-state-observation@v1",
+                "request_sha256": receipt["request_sha256"],
+                "phase": "post",
+                "producer": receipt["producer"],
+                "forge_url": request["forge_url"],
+                "repository": receipt["repository"],
+                "issue_number": receipt["issue_number"],
+                "state": receipt["state"],
+                "idempotency_marker": receipt["idempotency_marker"],
+            }
+            self.assertEqual(
+                receipt["post_observation_sha256"], self.digest(post_identity)
+            )
+            pre_at = datetime.fromisoformat(pre["observed_at"])
+            closed_at = datetime.fromisoformat(receipt["closure_created_at"])
+            post_at = datetime.fromisoformat(receipt["observed_at"])
+            transition_seconds = (closed_at - pre_at).total_seconds()
+            self.assertGreaterEqual(transition_seconds, 0)
+            self.assertLessEqual(transition_seconds, 300)
+            self.assertLessEqual(closed_at, post_at)
+            self.assertTrue(receipt["closure_actor"].strip())
 
 
 if __name__ == "__main__":

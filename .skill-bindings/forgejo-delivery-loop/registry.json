@@ -29,7 +29,7 @@
         "http://localhost:3000/neon/blackbox-auto-research/issues/18"
       ],
       "pr_urls": [],
-      "note": "Forgejo is a tracking-only projection. Git commits, GitHub issues and evidence remain the source of truth. Issue 17 records a closed GitHub source issue but remains open locally until a typed desired-state closure contract exists."
+      "note": "Forgejo is a tracking-only projection. Git commits, GitHub issues and evidence remain the source of truth. Issues 17 and 18 are closed with typed request, authenticated source/pre/post/timeline readback receipts under receipts/. These transitions do not change runtime maturity."
     }
   ]
 }
