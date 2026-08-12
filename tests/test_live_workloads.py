@@ -23,8 +23,10 @@ class LiveWorkloadTests(unittest.TestCase):
             run_sqlite_etl_workload(),
             run_ci_remediation_workload(),
         )
-        self.assertTrue(all(item.passed for item in items))
-        self.assertTrue(all(item.outcome_digest.startswith("sha256:") for item in items))
+        for item in items:
+            with self.subTest(workload=item.workload):
+                self.assertTrue(item.passed, item.metadata)
+                self.assertTrue(item.outcome_digest.startswith("sha256:"))
         envelope = evidence_envelope(items)
         self.assertEqual("blackbox-domain-evidence/v1", envelope["schema"])
         self.assertEqual("L2_SANDBOX", envelope["maturity"])

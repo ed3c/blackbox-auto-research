@@ -174,10 +174,11 @@ def run_ci_remediation_workload() -> WorkloadEvidence:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         test_file = root / "test_target.py"
+        test_command = [sys.executable, "-B", "-m", "unittest", "-q"]
         test_file.write_text("import unittest\n\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(1 + 1, 3)\n")
-        failing = subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=root, capture_output=True).returncode != 0
+        failing = subprocess.run(test_command, cwd=root, capture_output=True).returncode != 0
         test_file.write_text("import unittest\n\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(1 + 1, 2)\n")
-        repaired = subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=root, capture_output=True).returncode == 0
+        repaired = subprocess.run(test_command, cwd=root, capture_output=True).returncode == 0
         data = test_file.read_bytes()
         return WorkloadEvidence(
             "ci-remediation",
