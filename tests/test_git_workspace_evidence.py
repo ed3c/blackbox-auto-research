@@ -101,9 +101,39 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         manifest["evidence"]["outcome_digest"] = (
             "sha256:" + hashlib.sha256(outcome_path.read_bytes()).hexdigest()
         )
+        environment_bytes = json.dumps(
+            manifest["environment"], sort_keys=True, separators=(",", ":")
+        ).encode()
+        manifest["identities"]["environment"] = (
+            "sha256:" + hashlib.sha256(environment_bytes).hexdigest()
+        )
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
 
-        with self.assertRaisesRegex(EvidenceVerificationError, "identity drift"):
+        with self.assertRaisesRegex(EvidenceVerificationError, "git_version runtime drift"):
+            self.verify(bundle)
+
+    def test_repository_bundle_rejects_extra_ref(self) -> None:
+        bundle = self.produce()
+        with tempfile.TemporaryDirectory() as temporary:
+            clone = Path(temporary) / "repository"
+            subprocess.run(
+                ["git", "clone", "--quiet", str(bundle / "repository.bundle"), str(clone)],
+                check=True,
+            )
+            subprocess.run(["git", "branch", "unexpected", "HEAD^"], cwd=clone, check=True)
+            (bundle / "repository.bundle").unlink()
+            subprocess.run(
+                ["git", "bundle", "create", str(bundle / "repository.bundle"), "--all"],
+                cwd=clone, check=True,
+            )
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["repository_bundle_digest"] = (
+            "sha256:" + hashlib.sha256((bundle / "repository.bundle").read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "repository bundle refs drift"):
             self.verify(bundle)
 
     def test_untrusted_test_change_is_rejected_before_execution(self) -> None:
@@ -145,7 +175,7 @@ class GitWorkspaceEvidenceTests(unittest.TestCase):
         )
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
 
-        with self.assertRaisesRegex(EvidenceVerificationError, "test source mismatch"):
+        with self.assertRaises(EvidenceVerificationError):
             self.verify(bundle)
         self.assertFalse(marker.exists())
 

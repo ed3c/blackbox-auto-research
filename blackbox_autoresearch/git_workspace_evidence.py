@@ -251,6 +251,12 @@ def _tree(bundle_clone: Path, revision: str) -> dict[str, str]:
 
 
 def _verify_repository(bundle: Path, outcome: dict[str, Any]) -> None:
+    heads = _run("git", "bundle", "list-heads", str(bundle), cwd=bundle.parent).stdout.splitlines()
+    if heads != [
+        f"{outcome.get('final_head')} refs/heads/main",
+        f"{outcome.get('final_head')} HEAD",
+    ]:
+        raise EvidenceVerificationError("repository bundle refs drift")
     with tempfile.TemporaryDirectory() as temporary:
         clone = Path(temporary) / "repository"
         cloned = subprocess.run(
@@ -355,6 +361,13 @@ def verify_git_workspace_evidence(
             raise EvidenceVerificationError(f"{name} must be non-empty")
         if outcome.get(name) != environment[name]:
             raise EvidenceVerificationError(f"{name} outcome drift")
+    observed_versions = {
+        "git_version": _run("git", "--version", cwd=bundle_dir).stdout.strip(),
+        "python_version": _run(sys.executable, "--version", cwd=bundle_dir).stdout.strip(),
+    }
+    for name, observed in observed_versions.items():
+        if environment[name] != observed:
+            raise EvidenceVerificationError(f"{name} runtime drift")
     identities = _require_object(manifest.get("identities"), "identities")
     _require_keys(identities, {"task", "candidate", "environment", "harness", "evaluator", "policy"}, "identities")
     expected_identities = _identity_map(
