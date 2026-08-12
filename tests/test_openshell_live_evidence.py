@@ -16,12 +16,16 @@ from blackbox_autoresearch.openshell_live_evidence import (
 
 
 IMAGE = "sha256:" + "a" * 64
+DERIVED_IMAGE = "sha256:" + "b" * 64
 
 
 class FakeOpenShell:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.exists = False
+        self.evaluator_bytes = b""
+        self.image_exists = False
+        self.tags: set[str] = set()
+        self.sandboxes: set[str] = set()
 
     def __call__(self, argv: tuple[str, ...]) -> CommandResult:
         code = 0
@@ -29,16 +33,44 @@ class FakeOpenShell:
         stderr = ""
         if argv == ("openshell", "--version"):
             stdout = "openshell 0.0.59\n"
+        elif argv[:2] == ("docker", "build"):
+            self.image_exists = True
+            source = Path(argv[-1]) / "evaluator-source.txt"
+            self.evaluator_bytes = source.read_bytes()
+            stdout = DERIVED_IMAGE + "\n"
+        elif argv[:3] == ("docker", "image", "tag"):
+            self.tags.add(argv[-1])
+        elif argv[:3] == ("docker", "image", "rm"):
+            if argv[-1] == DERIVED_IMAGE:
+                self.image_exists = False
+            else:
+                self.tags.discard(argv[-1])
+        elif argv[:3] == ("docker", "image", "inspect"):
+            target = argv[-1]
+            if target in self.tags and "--format" in argv:
+                stdout = IMAGE + "\n"
+            elif target == DERIVED_IMAGE and self.image_exists:
+                stdout = DERIVED_IMAGE + "\n"
+            else:
+                code, stderr = 1, "image not found"
         elif argv[1:3] == ("sandbox", "create"):
-            self.exists = True
-        elif argv[1:3] == ("sandbox", "get") and self.exists:
-            stdout = "Id: 11111111-2222-3333-4444-555555555555\nPhase: Ready\n"
+            self.sandboxes.add(argv[argv.index("--name") + 1])
+        elif argv[1:3] == ("sandbox", "get") and argv[-1] in self.sandboxes:
+            sandbox_id = (
+                "66666666-7777-8888-9999-aaaaaaaaaaaa"
+                if argv[-1].endswith("-verifier")
+                else "11111111-2222-3333-4444-555555555555"
+            )
+            stdout = f"Id: {sandbox_id}\nPhase: Ready\n"
         elif argv[1:3] == ("policy", "get"):
             stdout = json.dumps({
                 "hash": "1" * 64,
                 "status": "effective",
                 "policy": {
-                    "filesystem_policy": {"read_only": ["/etc"], "read_write": ["/sandbox"]},
+                    "filesystem_policy": {
+                        "read_only": ["/etc"],
+                        "read_write": ["/sandbox", "/tmp"],
+                    },
                     "network_policies": {
                         "allow": {
                             "binaries": [{"path": "/usr/bin/curl"}],
@@ -48,7 +80,12 @@ class FakeOpenShell:
                 },
             })
         elif argv[1:3] == ("sandbox", "exec"):
-            if "/sandbox/candidate.sh" in argv:
+            sandbox_name = argv[argv.index("--name") + 1]
+            if sandbox_name.endswith("-verifier") and self.evaluator_bytes and argv[-2:] == (
+                "/usr/bin/cat", "/evaluator/canary.txt"
+            ):
+                stdout = self.evaluator_bytes.decode()
+            elif "/sandbox/candidate.sh" in argv:
                 stdout = "openshell-live-evidence-v1\n"
             elif "/etc/blackbox-evidence-probe" in argv:
                 code, stderr = 1, "permission denied"
@@ -56,11 +93,13 @@ class FakeOpenShell:
                 code, stderr = 22, "proxy denied"
             elif "/bin/sleep" in argv:
                 code, stderr = 124, "timeout"
+            elif any("/evaluator/canary.txt" in value for value in argv):
+                code, stderr = 1, "permission denied"
         elif argv[1:3] == ("sandbox", "download"):
             Path(argv[-1]).write_text("openshell-live-evidence-v1\n")
         elif argv[1:3] == ("sandbox", "delete"):
-            self.exists = False
-        elif argv[1:3] == ("sandbox", "get") and not self.exists:
+            self.sandboxes.discard(argv[-1])
+        elif argv[1:3] == ("sandbox", "get") and argv[-1] not in self.sandboxes:
             code, stderr = 1, "not found"
         return CommandResult(argv, code, stdout, stderr)
 
@@ -105,20 +144,34 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
         self.assertTrue(receipt["verified"])
         self.assertEqual(receipt["maturity_decision"], "unchanged")
         self.assertEqual(outcome["maturity_after"], "L1 REFERENCE")
-        self.assertEqual(outcome["unproven_probes"], ["credential-broker", "evaluator-isolation"])
-        self.assertEqual(manifest["run_manifest"]["max_actions"], 14)
+        self.assertEqual(outcome["unproven_probes"], ["credential-broker"])
+        self.assertEqual(manifest["run_manifest"]["max_actions"], 30)
         self.assertEqual(
-            manifest["runtime"]["sandbox_id"], "11111111-2222-3333-4444-555555555555"
+            manifest["runtime"]["candidate_sandbox_id"],
+            "11111111-2222-3333-4444-555555555555",
+        )
+        self.assertEqual(
+            manifest["runtime"]["verifier_sandbox_id"],
+            "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        )
+        self.assertEqual(
+            (bundle / "evaluator-source.txt").read_bytes(),
+            (bundle / "evaluator-after.txt").read_bytes(),
         )
 
     def test_uses_pinned_image_and_disables_automatic_providers(self) -> None:
         bundle = self.produce()
         events = json.loads((bundle / "trajectory.json").read_text())["events"]
-        create = next(event for event in events if event["name"] == "create")
+        create = next(event for event in events if event["name"] == "candidate-create")
 
-        self.assertIn(IMAGE, create["argv"])
+        self.assertIn(DERIVED_IMAGE, create["argv"])
         self.assertIn("--no-auto-providers", create["argv"])
         self.assertNotIn("--auto-providers", create["argv"])
+        dockerfile = (bundle / "Dockerfile.evaluator").read_text()
+        self.assertIn("FROM blackbox-openshell-base:", dockerfile)
+        self.assertNotIn(f"FROM {IMAGE}", dockerfile)
+        self.assertIn("chmod 0777 /evaluator", dockerfile)
+        self.assertIn("chmod 0666 /evaluator/canary.txt", dockerfile)
 
     def test_trajectory_tamper_fails_closed(self) -> None:
         bundle = self.produce()
@@ -156,6 +209,49 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
                 evaluator_path=self.evaluator,
             )
 
+    def test_evaluator_artifact_tamper_fails_closed(self) -> None:
+        bundle = self.produce()
+        (bundle / "evaluator-after.txt").write_text("forged\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "evaluator_after evidence digest mismatch"):
+            self.verify(bundle)
+
+    def test_dockerfile_rebinding_fails_closed(self) -> None:
+        bundle = self.produce()
+        dockerfile = bundle / "Dockerfile.evaluator"
+        dockerfile.write_text(dockerfile.read_text().replace("0666", "0444"))
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["evaluator_dockerfile"]["digest"] = (
+            "sha256:" + hashlib.sha256(dockerfile.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "evaluator Dockerfile drift"):
+            self.verify(bundle)
+
+    def test_candidate_output_cannot_expose_canary_even_if_trajectory_is_rebound(self) -> None:
+        bundle = self.produce()
+        canary = (bundle / "evaluator-source.txt").read_text().strip()
+        trajectory_path = bundle / "trajectory.json"
+        trajectory = json.loads(trajectory_path.read_text())
+        read_event = next(
+            event for event in trajectory["events"] if event["name"] == "evaluator-read-deny"
+        )
+        read_event["stdout"] = canary
+        trajectory_path.write_text(
+            json.dumps(trajectory, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["trajectory"]["digest"] = (
+            "sha256:" + hashlib.sha256(trajectory_path.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "exposed evaluator canary"):
+            self.verify(bundle)
+
     def test_version_drift_fails_before_sandbox_creation(self) -> None:
         fake = FakeOpenShell(self.root)
 
@@ -169,7 +265,7 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
                 self.root / "bundle", config=self.config, harness_path=self.harness,
                 evaluator_path=self.evaluator, runner=drifted,
             )
-        self.assertFalse(fake.exists)
+        self.assertFalse(fake.sandboxes)
 
 
 if __name__ == "__main__":
