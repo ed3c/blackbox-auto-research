@@ -1,0 +1,13 @@
+{
+  "forge_url": "http://localhost:3000",
+  "idempotency_marker": "https://github.com/ed3c/blackbox-auto-research/issues/50",
+  "issue_number": 18,
+  "observed_at": "2026-08-12T17:18:29+00:00",
+  "phase": "pre",
+  "producer": "forgejo-api-authenticated-read",
+  "repository": "neon/blackbox-auto-research",
+  "request_sha256": "sha256:b7601fc257ec853107c9cf4f3eb29149cbc0ade29cc71453dad716ca47b5455e",
+  "schema_version": "forgejo-issue-state-observation@v1",
+  "state": "open",
+  "status": "captured"
+}

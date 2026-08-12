@@ -1,0 +1,23 @@
+{
+  "schema_version": "forgejo-terminal-issue-state-request@v2",
+  "forge_url": "http://localhost:3000",
+  "repository": "neon/blackbox-auto-research",
+  "issue_number": 18,
+  "action": "set-state",
+  "expected_state": "open",
+  "desired_state": "closed",
+  "idempotency_marker": "https://github.com/ed3c/blackbox-auto-research/issues/50",
+  "source_receipt": {
+    "kind": "github-issue-closure",
+    "issue_url": "https://github.com/ed3c/blackbox-auto-research/issues/50",
+    "issue_state": "closed",
+    "pull_request_url": "https://github.com/ed3c/blackbox-auto-research/pull/58",
+    "merge_sha": "ca73dfc0301fd103bbb4ef8ee2ced1f06cdf61f1"
+  },
+  "admission": {
+    "status": "admitted",
+    "authority": "user",
+    "reason": "Explicit user request to synchronize the tracking projection"
+  },
+  "maturity_effect": "tracking-only-no-maturity-change"
+}
