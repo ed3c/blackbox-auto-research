@@ -23,12 +23,30 @@ class LiveWorkloadTests(unittest.TestCase):
             run_sqlite_etl_workload(),
             run_ci_remediation_workload(),
         )
-        self.assertTrue(all(item.passed for item in items))
-        self.assertTrue(all(item.outcome_digest.startswith("sha256:") for item in items))
+        for item in items:
+            with self.subTest(workload=item.workload):
+                self.assertTrue(item.passed, item.metadata)
+                self.assertTrue(item.outcome_digest.startswith("sha256:"))
         envelope = evidence_envelope(items)
         self.assertEqual("blackbox-domain-evidence/v1", envelope["schema"])
         self.assertEqual("L2_SANDBOX", envelope["maturity"])
         self.assertEqual(5, len(envelope["workloads"]))
+
+    def test_ci_remediation_executes_both_current_sources_without_bytecode_cache(self) -> None:
+        evidence = run_ci_remediation_workload()
+
+        self.assertTrue(evidence.passed, evidence.metadata)
+        self.assertEqual("seeded", evidence.metadata["seeded_source"])
+        self.assertEqual("repair", evidence.metadata["repaired_source"])
+        self.assertEqual("true", evidence.metadata["bytecode_cache_absent"])
+
+    def test_ci_remediation_deterministically_reproduces_stale_bytecode(self) -> None:
+        evidence = run_ci_remediation_workload(disable_bytecode_cache=False)
+
+        self.assertFalse(evidence.passed)
+        self.assertEqual("seeded", evidence.metadata["seeded_source"])
+        self.assertEqual("seeded", evidence.metadata["repaired_source"])
+        self.assertEqual("false", evidence.metadata["bytecode_cache_absent"])
 
     def test_differential_verifier_detects_seeded_regression(self) -> None:
         baseline = lambda value: value * 2
