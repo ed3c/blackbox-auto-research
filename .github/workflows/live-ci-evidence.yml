@@ -97,7 +97,7 @@ jobs:
             --runner-arch "${{ needs.produce.outputs.runner_arch }}" \
             --runner-image-os "${{ needs.produce.outputs.runner_image_os }}" \
             --runner-image-version "${{ needs.produce.outputs.runner_image_version }}" \
-            --platform-artifact-digest "${{ needs.produce.outputs.artifact_digest }}" \
+            --reported-platform-artifact-digest "${{ needs.produce.outputs.artifact_digest }}" \
             --tamper-probe
       - name: Persist independent verification receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

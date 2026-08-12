@@ -17,7 +17,7 @@ from blackbox_autoresearch.ci_live_evidence import (
 
 SOURCE_COMMIT = "1" * 40
 WORKFLOW_COMMIT = "2" * 40
-PLATFORM_DIGEST = "sha256:" + "3" * 64
+REPORTED_PLATFORM_DIGEST = "3" * 64
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -64,7 +64,7 @@ class CILiveEvidenceTests(unittest.TestCase):
             harness_path=self.harness,
             evaluator_path=self.evaluator,
             policy_path=self.policy,
-            platform_artifact_digest=PLATFORM_DIGEST,
+            reported_platform_artifact_digest=REPORTED_PLATFORM_DIGEST,
             run_tamper_probe=True,
         )
 
@@ -83,6 +83,8 @@ class CILiveEvidenceTests(unittest.TestCase):
         self.assertTrue(receipt["verified"])
         self.assertEqual("unassessed", receipt["maturity_decision"])
         self.assertEqual("bundle-integrity-and-context-match", receipt["verification_scope"])
+        self.assertEqual("sha256:" + REPORTED_PLATFORM_DIGEST, receipt["reported_platform_artifact_digest"])
+        self.assertFalse(receipt["platform_artifact_digest_verified"])
         self.assertEqual("rejected", receipt["tamper_probe"])
 
     def test_outcome_tamper_fails_closed(self) -> None:
@@ -112,7 +114,20 @@ class CILiveEvidenceTests(unittest.TestCase):
                 harness_path=self.harness,
                 evaluator_path=self.evaluator,
                 policy_path=self.policy,
-                platform_artifact_digest=PLATFORM_DIGEST,
+                reported_platform_artifact_digest=REPORTED_PLATFORM_DIGEST,
+            )
+
+    def test_malformed_reported_platform_digest_fails_closed(self) -> None:
+        bundle = self.produce()
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "reported platform artifact digest"):
+            verify_evidence_bundle(
+                bundle,
+                expected_context=self.context,
+                harness_path=self.harness,
+                evaluator_path=self.evaluator,
+                policy_path=self.policy,
+                reported_platform_artifact_digest="not-a-digest",
             )
 
     def test_evaluator_identity_tamper_fails_closed(self) -> None:
@@ -174,8 +189,8 @@ class CILiveEvidenceTests(unittest.TestCase):
                 str(bundle),
                 "--receipt",
                 str(receipt),
-                "--platform-artifact-digest",
-                PLATFORM_DIGEST,
+                "--reported-platform-artifact-digest",
+                REPORTED_PLATFORM_DIGEST,
                 "--tamper-probe",
                 *context_args,
             ],

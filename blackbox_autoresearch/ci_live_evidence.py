@@ -26,6 +26,7 @@ VERIFICATION_SCHEMA = "blackbox-ci-verification/v1"
 TARGET_MATURITY = "L3 LIVE"
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -212,6 +213,14 @@ def _parse_timestamp(value: object, name: str) -> datetime:
     return parsed
 
 
+def _normalize_reported_platform_digest(value: str) -> str:
+    if _HEX_DIGEST_RE.fullmatch(value):
+        return "sha256:" + value
+    if _DIGEST_RE.fullmatch(value):
+        return value
+    raise EvidenceVerificationError("reported platform artifact digest must be 64 lowercase hex chars")
+
+
 def _verify_without_probe(
     bundle_dir: Path,
     *,
@@ -219,10 +228,9 @@ def _verify_without_probe(
     harness_path: Path,
     evaluator_path: Path,
     policy_path: Path,
-    platform_artifact_digest: str,
+    reported_platform_artifact_digest: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not _DIGEST_RE.fullmatch(platform_artifact_digest):
-        raise EvidenceVerificationError("platform artifact digest must be sha256:<64 lowercase hex chars>")
+    _normalize_reported_platform_digest(reported_platform_artifact_digest)
     manifest_path = bundle_dir / "manifest.json"
     outcome_path = bundle_dir / "outcome.json"
     candidate_path = bundle_dir / "candidate.py"
@@ -320,7 +328,7 @@ def verify_evidence_bundle(
     harness_path: Path,
     evaluator_path: Path,
     policy_path: Path,
-    platform_artifact_digest: str,
+    reported_platform_artifact_digest: str,
     run_tamper_probe: bool = False,
 ) -> dict[str, object]:
     manifest, _ = _verify_without_probe(
@@ -329,7 +337,7 @@ def verify_evidence_bundle(
         harness_path=harness_path,
         evaluator_path=evaluator_path,
         policy_path=policy_path,
-        platform_artifact_digest=platform_artifact_digest,
+        reported_platform_artifact_digest=reported_platform_artifact_digest,
     )
     tamper_probe = "not-run"
     if run_tamper_probe:
@@ -345,7 +353,7 @@ def verify_evidence_bundle(
                     harness_path=harness_path,
                     evaluator_path=evaluator_path,
                     policy_path=policy_path,
-                    platform_artifact_digest=platform_artifact_digest,
+                    reported_platform_artifact_digest=reported_platform_artifact_digest,
                 )
             except EvidenceVerificationError as exc:
                 if str(exc) != "outcome digest mismatch":
@@ -369,7 +377,10 @@ def verify_evidence_bundle(
         "workflow_commit": expected_context.workflow_commit,
         "evidence_manifest_digest": _digest_file(bundle_dir / "manifest.json"),
         "outcome_digest": manifest["evidence"]["outcome_digest"],
-        "platform_artifact_digest": platform_artifact_digest,
+        "reported_platform_artifact_digest": _normalize_reported_platform_digest(
+            reported_platform_artifact_digest
+        ),
+        "platform_artifact_digest_verified": False,
         "evaluator_digest": manifest["identities"]["evaluator"],
         "tamper_probe": tamper_probe,
     }

@@ -25,7 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner-arch", required=True)
     parser.add_argument("--runner-image-os", required=True)
     parser.add_argument("--runner-image-version", required=True)
-    parser.add_argument("--platform-artifact-digest", required=True)
+    parser.add_argument("--reported-platform-artifact-digest", required=True)
     parser.add_argument("--tamper-probe", action="store_true")
     return parser
 
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         harness_path=ROOT / "scripts" / "produce_live_ci_evidence.py",
         evaluator_path=Path(__file__).resolve(),
         policy_path=ROOT / ".github" / "workflows" / "live-ci-evidence.yml",
-        platform_artifact_digest=args.platform_artifact_digest,
+        reported_platform_artifact_digest=args.reported_platform_artifact_digest,
         run_tamper_probe=args.tamper_probe,
     )
     args.receipt.parent.mkdir(parents=True, exist_ok=True)
