@@ -17,6 +17,9 @@ from blackbox_autoresearch.openshell_live_evidence import (
 
 IMAGE = "sha256:" + "a" * 64
 DERIVED_IMAGE = "sha256:" + "b" * 64
+ALLOWED_CREDENTIAL = "BBX_ALLOWED_SENTINEL"
+DENIED_CREDENTIAL = "BBX_DENIED_SENTINEL"
+PLACEHOLDER = "openshell-opaque-placeholder"
 
 
 class FakeOpenShell:
@@ -26,6 +29,8 @@ class FakeOpenShell:
         self.image_exists = False
         self.tags: set[str] = set()
         self.sandboxes: set[str] = set()
+        self.providers: dict[str, tuple[str, str]] = {}
+        self.credential_value = ""
 
     def __call__(self, argv: tuple[str, ...]) -> CommandResult:
         code = 0
@@ -33,6 +38,20 @@ class FakeOpenShell:
         stderr = ""
         if argv == ("openshell", "--version"):
             stdout = "openshell 0.0.59\n"
+        elif argv[1:3] == ("provider", "get"):
+            provider_name = argv[-1]
+            if provider_name in self.providers:
+                key, _ = self.providers[provider_name]
+                stdout = f"Name: {provider_name}\nCredential keys: {key}\n"
+            else:
+                code, stderr = 1, "provider not found"
+        elif argv[1:3] == ("provider", "create"):
+            provider_name = argv[argv.index("--name") + 1]
+            key, value = argv[argv.index("--credential") + 1].split("=", 1)
+            self.providers[provider_name] = (key, value)
+            self.credential_value = value
+        elif argv[1:3] == ("provider", "delete"):
+            self.providers.pop(argv[-1], None)
         elif argv[:2] == ("docker", "build"):
             self.image_exists = True
             source = Path(argv[-1]) / "evaluator-source.txt"
@@ -81,7 +100,11 @@ class FakeOpenShell:
             })
         elif argv[1:3] == ("sandbox", "exec"):
             sandbox_name = argv[argv.index("--name") + 1]
-            if sandbox_name.endswith("-verifier") and self.evaluator_bytes and argv[-2:] == (
+            if argv[-2:] == ("/usr/bin/printenv", ALLOWED_CREDENTIAL):
+                stdout = PLACEHOLDER + "\n"
+            elif argv[-2:] == ("/usr/bin/printenv", DENIED_CREDENTIAL):
+                code, stderr = 1, "not present"
+            elif sandbox_name.endswith("-verifier") and self.evaluator_bytes and argv[-2:] == (
                 "/usr/bin/cat", "/evaluator/canary.txt"
             ):
                 stdout = self.evaluator_bytes.decode()
@@ -123,9 +146,10 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
 
     def produce(self) -> Path:
         bundle = self.root / "bundle"
+        self.fake = FakeOpenShell(self.root)
         produce_openshell_evidence(
             bundle, config=self.config, harness_path=self.harness,
-            evaluator_path=self.evaluator, runner=FakeOpenShell(self.root),
+            evaluator_path=self.evaluator, runner=self.fake,
         )
         return bundle
 
@@ -135,16 +159,16 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
             evaluator_path=self.evaluator,
         )
 
-    def test_bundle_is_independently_verified_without_inflating_maturity(self) -> None:
+    def test_bundle_is_independently_verified_and_advances_to_l3(self) -> None:
         bundle = self.produce()
         receipt = self.verify(bundle)
         outcome = json.loads((bundle / "outcome.json").read_text())
         manifest = json.loads((bundle / "manifest.json").read_text())
 
         self.assertTrue(receipt["verified"])
-        self.assertEqual(receipt["maturity_decision"], "unchanged")
-        self.assertEqual(outcome["maturity_after"], "L1 REFERENCE")
-        self.assertEqual(outcome["unproven_probes"], ["credential-broker"])
+        self.assertEqual(receipt["maturity_decision"], "advance-to-L3")
+        self.assertEqual(outcome["maturity_after"], "L3 LIVE")
+        self.assertEqual(outcome["unproven_probes"], [])
         self.assertEqual(manifest["run_manifest"]["max_actions"], 30)
         self.assertEqual(
             manifest["runtime"]["candidate_sandbox_id"],
@@ -159,12 +183,13 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
             (bundle / "evaluator-after.txt").read_bytes(),
         )
 
-    def test_uses_pinned_image_and_disables_automatic_providers(self) -> None:
+    def test_uses_pinned_image_and_exact_explicit_provider(self) -> None:
         bundle = self.produce()
         events = json.loads((bundle / "trajectory.json").read_text())["events"]
         create = next(event for event in events if event["name"] == "candidate-create")
 
         self.assertIn(DERIVED_IMAGE, create["argv"])
+        self.assertIn("--provider", create["argv"])
         self.assertIn("--no-auto-providers", create["argv"])
         self.assertNotIn("--auto-providers", create["argv"])
         dockerfile = (bundle / "Dockerfile.evaluator").read_text()
@@ -172,6 +197,113 @@ class OpenShellLiveEvidenceTests(unittest.TestCase):
         self.assertNotIn(f"FROM {IMAGE}", dockerfile)
         self.assertIn("chmod 0777 /evaluator", dockerfile)
         self.assertIn("chmod 0666 /evaluator/canary.txt", dockerfile)
+
+    def test_credential_canary_and_placeholder_are_redacted_and_cleanup_is_proven(self) -> None:
+        bundle = self.produce()
+        trajectory = json.loads((bundle / "trajectory.json").read_text())
+        events = {event["name"]: event for event in trajectory["events"]}
+        outcome = json.loads((bundle / "outcome.json").read_text())
+
+        self.assertRegex(
+            events["provider-create"]["argv"][-1],
+            rf"^{ALLOWED_CREDENTIAL}=<redacted:sha256:[0-9a-f]{{64}}>$",
+        )
+        self.assertRegex(
+            events["credential-allowed"]["stdout"],
+            "^<opaque-placeholder:sha256:[0-9a-f]{64}>\\n$",
+        )
+        self.assertEqual(events["credential-denied"]["returncode"], 1)
+        self.assertNotEqual(
+            outcome["credential_canary_digest"],
+            outcome["credential_placeholder_digest"],
+        )
+        self.assertEqual(events["provider-absence"]["returncode"], 1)
+        self.assertFalse(self.fake.providers)
+        for path in bundle.iterdir():
+            if path.is_file():
+                self.assertNotIn(self.fake.credential_value.encode(), path.read_bytes())
+
+    def test_credential_placeholder_tamper_fails_closed_after_digest_rebind(self) -> None:
+        bundle = self.produce()
+        trajectory_path = bundle / "trajectory.json"
+        trajectory = json.loads(trajectory_path.read_text())
+        allowed = next(
+            event for event in trajectory["events"] if event["name"] == "credential-allowed"
+        )
+        allowed["stdout"] = "forged\n"
+        trajectory_path.write_text(
+            json.dumps(trajectory, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["trajectory"]["digest"] = (
+            "sha256:" + hashlib.sha256(trajectory_path.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "credential placeholder"):
+            self.verify(bundle)
+
+    def test_provider_command_tamper_fails_closed_after_trajectory_rebind(self) -> None:
+        bundle = self.produce()
+        trajectory_path = bundle / "trajectory.json"
+        trajectory = json.loads(trajectory_path.read_text())
+        provider_create = next(
+            event for event in trajectory["events"] if event["name"] == "provider-create"
+        )
+        provider_create["argv"][-1] = provider_create["argv"][-1].replace(
+            ALLOWED_CREDENTIAL, DENIED_CREDENTIAL
+        )
+        trajectory_path.write_text(
+            json.dumps(trajectory, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        manifest_path = bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["evidence"]["trajectory"]["digest"] = (
+            "sha256:" + hashlib.sha256(trajectory_path.read_bytes()).hexdigest()
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+        with self.assertRaisesRegex(EvidenceVerificationError, "credential provider command"):
+            self.verify(bundle)
+
+    def test_probe_failure_still_removes_temporary_provider(self) -> None:
+        fake = FakeOpenShell(self.root)
+
+        def failed_allowed_lookup(argv: tuple[str, ...]) -> CommandResult:
+            if argv[-2:] == ("/usr/bin/printenv", ALLOWED_CREDENTIAL):
+                return CommandResult(argv, 1, "", "injection failed")
+            return fake(argv)
+
+        with self.assertRaisesRegex(RuntimeError, "placeholder was not injected"):
+            produce_openshell_evidence(
+                self.root / "failed-bundle", config=self.config,
+                harness_path=self.harness, evaluator_path=self.evaluator,
+                runner=failed_allowed_lookup,
+            )
+        self.assertFalse(fake.providers)
+        self.assertFalse(fake.sandboxes)
+
+    def test_ambiguous_provider_create_failure_still_audits_cleanup(self) -> None:
+        fake = FakeOpenShell(self.root)
+
+        def failed_after_provider_create(argv: tuple[str, ...]) -> CommandResult:
+            result = fake(argv)
+            if argv[1:3] == ("provider", "create"):
+                return CommandResult(argv, 1, result.stdout, "ambiguous create failure")
+            return result
+
+        with self.assertRaisesRegex(RuntimeError, "credential provider create returned 1"):
+            produce_openshell_evidence(
+                self.root / "ambiguous-bundle", config=self.config,
+                harness_path=self.harness, evaluator_path=self.evaluator,
+                runner=failed_after_provider_create,
+            )
+        self.assertFalse(fake.providers)
 
     def test_trajectory_tamper_fails_closed(self) -> None:
         bundle = self.produce()
