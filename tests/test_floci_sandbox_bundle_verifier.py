@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from blackbox_autoresearch.floci_evidence_store import VERIFICATION_LIMITATIONS
-from scripts.run_floci_evidence_store_sandbox import RUN_LIMITATIONS
+from scripts.run_floci_evidence_store_sandbox import RUN_LIMITATIONS, _iam_policy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,10 +51,8 @@ def build_quarantine_bundle(root: Path) -> Path:
         "iam_enforcement": True,
     }
     environment_digest = digest_bytes(canonical(environment))
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [{"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}],
-    }
+    bucket = "evidence-aaaaaaaaaaaa"
+    policy = _iam_policy(bucket)
     payload = {
         "schema": "blackbox-floci-sandbox-payload/v1",
         "run_id": run_id,
@@ -119,12 +117,11 @@ def build_quarantine_bundle(root: Path) -> Path:
         }
     iam_stderr = "An error occurred (AccessDenied) when calling DeleteObject"
     endpoint = "https://127.0.0.1:4566"
-    bucket = "evidence-aaaaaaaaaaaa"
     artifact_hex = digest_bytes(payload_bytes).removeprefix("sha256:")
     key = f"artifacts/{artifact_hex[:2]}/{artifact_hex[2:]}"
     principal_digest = digest_bytes(b"fixture-access-key")
     receipt = {
-        "schema": "blackbox-floci-sandbox-run/v2",
+        "schema": "blackbox-floci-sandbox-run/v3",
         "provider_kind": "floci-emulator",
         "maturity": "L2 SANDBOX",
         "production_claim_allowed": False,
@@ -140,6 +137,13 @@ def build_quarantine_bundle(root: Path) -> Path:
         "finished_at": "2026-08-12T00:00:03+00:00",
         "source": {"kind": "local-clone", "commit": commit},
         "image_id": image_id,
+        "sandbox": {
+            "container_id": "c" * 64,
+            "producer_endpoint": "https://127.0.0.1:4565",
+            "verifier_endpoint": endpoint,
+            "ca_bundle_sha256": digest_bytes(b"fixture-ca"),
+            "image_id": image_id,
+        },
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
         "sigv4_configuration": "enabled",
@@ -160,6 +164,8 @@ def build_quarantine_bundle(root: Path) -> Path:
                 "s3api", "delete-object", "--bucket", bucket, "--key", key,
             ],
             "principal_access_key_sha256": principal_digest,
+            "credential_variant": "configured-secret",
+            "ca_bundle_sha256": digest_bytes(b"fixture-ca"),
             "returncode": 254,
             "stdout": "",
             "stderr": iam_stderr,
@@ -172,6 +178,8 @@ def build_quarantine_bundle(root: Path) -> Path:
                 "s3api", "head-object", "--bucket", bucket, "--key", key,
             ],
             "principal_access_key_sha256": principal_digest,
+            "credential_variant": "wrong-secret",
+            "ca_bundle_sha256": digest_bytes(b"fixture-ca"),
             "returncode": 0,
             "stdout": "{}\n",
             "stderr": "",
@@ -233,13 +241,13 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
     def test_replays_the_committed_quarantine_bundle(self) -> None:
         receipt = (
             ROOT
-            / "evidence/floci/floci-sandbox-20260812-05/runner-receipt.json"
+            / "evidence/floci/floci-sandbox-20260812-07/runner-receipt.json"
         )
 
         result = self.run_verifier(receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"run_id": "floci-sandbox-20260812-05"', result.stdout)
+        self.assertIn('"run_id": "floci-sandbox-20260812-07"', result.stdout)
         self.assertIn('"decision": "quarantine"', result.stdout)
 
     def test_rejects_a_tampered_child_before_semantic_replay(self) -> None:
@@ -303,6 +311,62 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("probe argv mismatch", result.stderr)
+
+    def test_rejects_probes_from_different_sandbox_endpoints(self) -> None:
+        with self.temporary_directory() as raw:
+            root = Path(raw)
+            receipt_path = build_quarantine_bundle(root)
+            receipt = json.loads(receipt_path.read_bytes())
+            receipt["invalid_signature_probe"]["argv"][2] = "https://127.0.0.1:4567"
+            write_json(receipt_path, receipt)
+
+            result = self.run_verifier(receipt_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("sandbox endpoint mismatch", result.stderr)
+
+    def test_rejects_policy_semantic_drift_even_when_digests_are_updated(self) -> None:
+        with self.temporary_directory() as raw:
+            root = Path(raw)
+            receipt_path = build_quarantine_bundle(root)
+            policy_path = root / "iam-policy.json"
+            policy = json.loads(policy_path.read_bytes())
+            policy["Statement"] = [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+            policy_bytes = write_json(policy_path, policy)
+            receipt = json.loads(receipt_path.read_bytes())
+            receipt["evidence_artifacts"]["iam_policy"].update(
+                sha256=digest_bytes(policy_bytes), size=len(policy_bytes)
+            )
+            manifest_path = root / "producer-manifest.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["identities"]["policy"] = digest_bytes(canonical(policy))
+            manifest_bytes = write_json(manifest_path, manifest)
+            receipt["evidence_artifacts"]["producer_manifest"].update(
+                sha256=digest_bytes(manifest_bytes), size=len(manifest_bytes)
+            )
+            write_json(receipt_path, receipt)
+
+            result = self.run_verifier(receipt_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("IAM policy semantics mismatch", result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs unavailable")
+    def test_rejects_fifo_receipt_without_blocking(self) -> None:
+        with self.temporary_directory() as raw:
+            receipt = Path(raw) / "runner-receipt.json"
+            os.mkfifo(receipt)
+
+            result = subprocess.run(
+                ["python3", str(VERIFIER), "--receipt", str(receipt)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=2,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("regular file", result.stderr)
 
     def test_rejects_scope_or_limitations_drift(self) -> None:
         for field, value in (

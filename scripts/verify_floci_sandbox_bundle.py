@@ -32,6 +32,7 @@ from scripts.run_floci_evidence_store_sandbox import (  # noqa: E402
     _digest_bytes,
     _digest_files,
     _evaluate_aws_probe,
+    _iam_policy,
     _reproduction_metadata,
 )
 
@@ -43,6 +44,7 @@ _ARTIFACT_NAMES = {
     "input_payload": "input-payload.json",
     "iam_policy": "iam-policy.json",
 }
+_MAX_EVIDENCE_BYTES = 1024 * 1024
 
 
 def _require(condition: bool, detail: str) -> None:
@@ -69,7 +71,7 @@ def _read_regular_file(path: Path, name: str) -> bytes:
     try:
         for index, component in enumerate(absolute.parts[1:]):
             is_last = index == len(absolute.parts[1:]) - 1
-            flags = os.O_RDONLY | os.O_NOFOLLOW
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if not is_last:
                 flags |= os.O_DIRECTORY
             try:
@@ -78,10 +80,19 @@ def _read_regular_file(path: Path, name: str) -> bytes:
                 raise ValueError(f"cannot read {name} without symlink traversal: {error}") from error
             os.close(directory_fd)
             directory_fd = next_fd
-        _require(stat.S_ISREG(os.fstat(directory_fd).st_mode), f"{name} must be a regular file")
+        file_status = os.fstat(directory_fd)
+        file_size = file_status.st_size
+        _require(stat.S_ISREG(file_status.st_mode), f"{name} must be a regular file")
+        _require(file_size <= _MAX_EVIDENCE_BYTES, f"{name} exceeds evidence size limit")
         chunks = []
+        bytes_read = 0
         while chunk := os.read(directory_fd, 65536):
             chunks.append(chunk)
+            bytes_read += len(chunk)
+            _require(
+                bytes_read <= _MAX_EVIDENCE_BYTES,
+                f"{name} exceeds evidence size limit",
+            )
         return b"".join(chunks)
     finally:
         os.close(directory_fd)
@@ -127,18 +138,33 @@ def _replay_probe(
     operation: str,
     expected_errors: set[str],
     expected_argv: list[str],
+    expected_variant: str,
+    expected_ca_digest: str,
 ) -> tuple[str, str]:
     _require(isinstance(record, dict), f"{operation} probe must be an object")
     _require_keys(
         record,
         {
-            "operation", "argv", "principal_access_key_sha256", "returncode",
-            "stdout", "stderr", "outcome",
+            "operation", "argv", "principal_access_key_sha256", "credential_variant",
+            "ca_bundle_sha256", "returncode", "stdout", "stderr", "outcome",
         },
         f"{operation} probe",
     )
     _require(record["operation"] == operation, f"{operation} name mismatch")
+    argv = record["argv"]
+    _require(
+        isinstance(argv, list) and len(argv) >= 3 and argv[2] == expected_argv[2],
+        f"{operation} sandbox endpoint mismatch",
+    )
     _require(record["argv"] == expected_argv, f"{operation} probe argv mismatch")
+    _require(
+        record["credential_variant"] == expected_variant,
+        f"{operation} credential variant mismatch",
+    )
+    _require(
+        record["ca_bundle_sha256"] == expected_ca_digest,
+        f"{operation} CA bundle mismatch",
+    )
     principal_digest = record["principal_access_key_sha256"]
     _require(
         isinstance(principal_digest, str)
@@ -170,22 +196,20 @@ def _verify_common_claims(value: Mapping[str, object], name: str) -> None:
     )
 
 
-def _probe_argv(
-    record: object, action: str, bucket: str, key: str
-) -> list[str]:
-    _require(isinstance(record, dict), f"{action} probe must be an object")
-    argv = record.get("argv")
-    _require(isinstance(argv, list) and len(argv) >= 3, f"{action} probe argv is invalid")
-    endpoint = argv[2]
-    _require(isinstance(endpoint, str), f"{action} endpoint is invalid")
+def _validate_sandbox_endpoint(endpoint: object) -> str:
+    _require(isinstance(endpoint, str), "sandbox endpoint is invalid")
     parsed = urlparse(endpoint)
     _require(
         parsed.scheme == "https"
         and parsed.hostname in {"127.0.0.1", "localhost"}
         and parsed.port is not None
         and parsed.path == "",
-        f"{action} endpoint is outside the loopback sandbox",
+        "sandbox endpoint is outside the loopback sandbox",
     )
+    return endpoint
+
+
+def _probe_argv(endpoint: str, action: str, bucket: str, key: str) -> list[str]:
     return [
         "aws", "--endpoint-url", endpoint, "--ca-bundle", "$RUN_CA_BUNDLE",
         "s3api", action, "--bucket", bucket, "--key", key,
@@ -269,6 +293,7 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
             "schema", "provider_kind", "maturity", "production_claim_allowed",
             "decision", "verified_scope", "run_id", "started_at", "finished_at",
             "source", "image_id", "storage_mode", "tls", "sigv4_configuration",
+            "sandbox",
             "sigv4_wrong_secret", "iam_enforcement", "security_decision",
             "restart_reverification", "iam_delete_denied", "invalid_signature_denied",
             "iam_delete_probe", "invalid_signature_probe", "teardown", "verification",
@@ -382,21 +407,49 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
     commit = environment_value.get("commit")
     _require(isinstance(commit, str), "environment commit is invalid")
     bucket = f"evidence-{commit[:12]}"
+    _require(policy == _iam_policy(bucket), "IAM policy semantics mismatch")
     artifact_hex = str(artifact["digest"]).removeprefix("sha256:")
     key = f"artifacts/{artifact_hex[:2]}/{artifact_hex[2:]}"
     iam_record = receipt["iam_delete_probe"]
     signature_record = receipt["invalid_signature_probe"]
+    sandbox = receipt["sandbox"]
+    _require(isinstance(sandbox, dict), "sandbox identity must be an object")
+    _require_keys(
+        sandbox,
+        {
+            "container_id", "producer_endpoint", "verifier_endpoint",
+            "ca_bundle_sha256", "image_id",
+        },
+        "sandbox identity",
+    )
+    _validate_sandbox_endpoint(sandbox["producer_endpoint"])
+    endpoint = _validate_sandbox_endpoint(sandbox["verifier_endpoint"])
+    ca_digest = sandbox["ca_bundle_sha256"]
+    _require(
+        isinstance(ca_digest, str) and _DIGEST_RE.fullmatch(ca_digest) is not None,
+        "sandbox CA digest is malformed",
+    )
+    _require(sandbox["image_id"] == receipt["image_id"], "sandbox image mismatch")
+    _require(
+        isinstance(sandbox["container_id"], str)
+        and re.fullmatch(r"[0-9a-f]{64}", sandbox["container_id"]) is not None,
+        "sandbox container identity is malformed",
+    )
     iam_status, iam_principal = _replay_probe(
         iam_record,
         "s3-delete-object",
         {"AccessDenied", "AccessDeniedException"},
-        _probe_argv(iam_record, "delete-object", bucket, key),
+        _probe_argv(endpoint, "delete-object", bucket, key),
+        "configured-secret",
+        ca_digest,
     )
     signature_status, signature_principal = _replay_probe(
         signature_record,
         "s3-head-object-with-wrong-secret",
         {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
-        _probe_argv(signature_record, "head-object", bucket, key),
+        _probe_argv(endpoint, "head-object", bucket, key),
+        "wrong-secret",
+        ca_digest,
     )
     _require(iam_principal == signature_principal, "probe principal identity mismatch")
     _require(receipt["iam_delete_denied"] == (iam_status == "denied"), "IAM probe mismatch")

@@ -30,7 +30,7 @@ from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
 )
 
 
-RUN_SCHEMA = "blackbox-floci-sandbox-run/v2"
+RUN_SCHEMA = "blackbox-floci-sandbox-run/v3"
 BASE_VERIFIED_SCOPE = (
     "S3 content-addressed round-trip",
     "WAL restart",
@@ -49,6 +49,15 @@ _T = TypeVar("_T")
 class AwsProbeOutcome:
     status: str
     detail: str
+
+
+@dataclass(frozen=True)
+class AwsExecution:
+    result: subprocess.CompletedProcess[str]
+    endpoint: str
+    ca_bundle_sha256: str
+    principal_access_key_sha256: str
+    credential_variant: str
 
 
 @dataclass(frozen=True)
@@ -221,7 +230,8 @@ def _aws(
     credentials: dict[str, str],
     *args: str,
     check: bool = True,
-) -> subprocess.CompletedProcess[str]:
+    credential_variant: str = "configured-secret",
+) -> AwsExecution:
     environment = {
         **os.environ,
         **credentials,
@@ -229,7 +239,7 @@ def _aws(
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_PAGER": "",
     }
-    return _run(
+    result = _run(
         "aws",
         "--endpoint-url",
         endpoint,
@@ -240,6 +250,15 @@ def _aws(
         env=environment,
         check=check,
     )
+    return AwsExecution(
+        result=result,
+        endpoint=endpoint,
+        ca_bundle_sha256=_digest_bytes(ca_bundle.read_bytes()),
+        principal_access_key_sha256=_digest_bytes(
+            credentials["AWS_ACCESS_KEY_ID"].encode()
+        ),
+        credential_variant=credential_variant,
+    )
 
 
 def _container_endpoint(name: str) -> str:
@@ -247,6 +266,13 @@ def _container_endpoint(name: str) -> str:
     if len(mapping) != 1 or ":" not in mapping[0]:
         raise RuntimeError(f"unexpected Floci port mapping: {mapping}")
     return "https://127.0.0.1:" + mapping[0].rsplit(":", 1)[1]
+
+
+def _container_id(name: str) -> str:
+    value = _run("docker", "inspect", name, "--format", "{{.Id}}", cwd=ROOT).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RuntimeError("Floci container identity is malformed")
+    return value
 
 
 def _create_container(name: str, image_id: str, data_dir: Path | str) -> None:
@@ -295,17 +321,19 @@ def _security_decision(iam_probe: AwsProbeOutcome, signature_probe: AwsProbeOutc
 
 def _probe_receipt(
     operation: str,
-    result: subprocess.CompletedProcess[str],
+    execution: AwsExecution,
     outcome: AwsProbeOutcome,
-    access_key_id: str,
 ) -> dict[str, object]:
+    result = execution.result
     argv = list(result.args)
     ca_index = argv.index("--ca-bundle") + 1
     argv[ca_index] = "$RUN_CA_BUNDLE"
     return {
         "operation": operation,
         "argv": argv,
-        "principal_access_key_sha256": _digest_bytes(access_key_id.encode()),
+        "principal_access_key_sha256": execution.principal_access_key_sha256,
+        "credential_variant": execution.credential_variant,
+        "ca_bundle_sha256": execution.ca_bundle_sha256,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -331,11 +359,8 @@ def _evaluate_teardown(
     )
 
 
-def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
-    bootstrap = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-    username = "blackbox-evidence-writer"
-    _aws(endpoint, ca_bundle, bootstrap, "iam", "create-user", "--user-name", username)
-    policy = {
+def _iam_policy(bucket: str) -> dict[str, object]:
+    return {
         "Version": "2012-10-17",
         "Statement": [
             {"Effect": "Allow", "Action": "s3:CreateBucket", "Resource": "*"},
@@ -346,6 +371,13 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
             },
         ],
     }
+
+
+def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
+    bootstrap = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+    username = "blackbox-evidence-writer"
+    _aws(endpoint, ca_bundle, bootstrap, "iam", "create-user", "--user-name", username)
+    policy = _iam_policy(bucket)
     _aws(
         endpoint,
         ca_bundle,
@@ -370,7 +402,7 @@ def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[st
         "--output",
         "json",
     )
-    access = json.loads(created.stdout)["AccessKey"]
+    access = json.loads(created.result.stdout)["AccessKey"]
     credentials = {
         "AWS_ACCESS_KEY_ID": access["AccessKeyId"],
         "AWS_SECRET_ACCESS_KEY": access["SecretAccessKey"],
@@ -439,6 +471,7 @@ def _execute(
     signature_probe_receipt: dict[str, object] | None = None
     restart_receipt: dict[str, object] | None = None
     policy: dict[str, object] = {}
+    sandbox: dict[str, str] | None = None
     with tempfile.TemporaryDirectory(prefix="blackbox-floci-") as temporary:
         runtime = Path(temporary)
         data_dir = runtime / "data"
@@ -451,6 +484,13 @@ def _execute(
             container_created = True
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
+            sandbox = {
+                "container_id": _container_id(container_name),
+                "producer_endpoint": endpoint,
+                "verifier_endpoint": "not-run",
+                "ca_bundle_sha256": _digest_bytes(ca_bundle.read_bytes()),
+                "image_id": image_id,
+            }
             print("bootstrapping restricted IAM principal", flush=True)
             credentials, policy = _bootstrap_iam(endpoint, ca_bundle, f"evidence-{commit[:12]}")
             identity = FlociEvidenceIdentity(
@@ -510,6 +550,7 @@ def _execute(
             restarted = _run("docker", "start", container_name, cwd=ROOT)
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
+            sandbox["verifier_endpoint"] = endpoint
             verifier_config = {**config, "endpoint": endpoint}
             verifier_config_path = runtime / "verifier-config.json"
             _write_json(verifier_config_path, verifier_config)
@@ -547,12 +588,11 @@ def _execute(
                 key,
                 check=False,
             )
-            iam_probe = _evaluate_aws_probe(denied, {"AccessDenied", "AccessDeniedException"})
+            iam_probe = _evaluate_aws_probe(denied.result, {"AccessDenied", "AccessDeniedException"})
             iam_probe_receipt = _probe_receipt(
                 "s3-delete-object",
                 denied,
                 iam_probe,
-                credentials["AWS_ACCESS_KEY_ID"],
             )
             iam_delete_denied = iam_probe.status == "denied"
             wrong_credentials = {
@@ -570,16 +610,16 @@ def _execute(
                 "--key",
                 key,
                 check=False,
+                credential_variant="wrong-secret",
             )
             signature_probe = _evaluate_aws_probe(
-                bad_signature,
+                bad_signature.result,
                 {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
             )
             signature_probe_receipt = _probe_receipt(
                 "s3-head-object-with-wrong-secret",
                 bad_signature,
                 signature_probe,
-                credentials["AWS_ACCESS_KEY_ID"],
             )
             invalid_signature_denied = signature_probe.status == "denied"
             evidence_artifacts = _export_evidence_bundle(
@@ -603,6 +643,7 @@ def _execute(
         or evidence_artifacts is None
         or iam_probe_receipt is None
         or signature_probe_receipt is None
+        or sandbox is None
         or restart_receipt is None
         or teardown.status != "container-absent"
     ):
@@ -624,6 +665,7 @@ def _execute(
         "finished_at": finished_at,
         "source": {"kind": "local-clone", "commit": commit},
         "image_id": image_id,
+        "sandbox": sandbox,
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
         "sigv4_configuration": "enabled",

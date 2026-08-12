@@ -11,6 +11,7 @@ from scripts.run_floci_evidence_store_sandbox import (
     RUN_SCHEMA,
     AwsProbeOutcome,
     _create_container,
+    _aws,
     _evaluate_aws_probe,
     _evaluate_teardown,
     _export_evidence_bundle,
@@ -24,7 +25,7 @@ from scripts.run_floci_evidence_store_sandbox import (
 
 class FlociEvidenceStoreRunnerTests(unittest.TestCase):
     def test_run_and_verifier_schema_changes_are_explicit(self):
-        self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v2")
+        self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v3")
         self.assertEqual(
             VERIFICATION_SCHEMA,
             "blackbox-floci-evidence-store-verification/v2",
@@ -189,14 +190,23 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
     def test_probe_receipt_preserves_raw_result_and_classification(self):
         result = subprocess.CompletedProcess(
             ("aws", "--ca-bundle", "/tmp/ca.pem", "s3api", "delete-object"),
-            254,
-            "",
-            "An error occurred (AccessDenied) when calling DeleteObject",
+            254, "", "An error occurred (AccessDenied) when calling DeleteObject",
         )
-        outcome = _evaluate_aws_probe(result, {"AccessDenied"})
+        with tempfile.TemporaryDirectory() as raw:
+            ca_bundle = Path(raw) / "ca.pem"
+            ca_bundle.write_bytes(b"fixture-ca")
+            with patch("scripts.run_floci_evidence_store_sandbox._run", return_value=result):
+                execution = _aws(
+                    "https://127.0.0.1:4566",
+                    ca_bundle,
+                    {"AWS_ACCESS_KEY_ID": "fixture-key", "AWS_SECRET_ACCESS_KEY": "wrong"},
+                    "s3api", "delete-object",
+                    credential_variant="wrong-secret",
+                )
+        outcome = _evaluate_aws_probe(execution.result, {"AccessDenied"})
 
         self.assertEqual(
-            _probe_receipt("s3-delete-object", result, outcome, "fixture-key"),
+            _probe_receipt("s3-delete-object", execution, outcome),
             {
                 "operation": "s3-delete-object",
                 "argv": [
@@ -207,6 +217,8 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
                     "delete-object",
                 ],
                 "principal_access_key_sha256": "sha256:66e7c82b49bb291dd09c8e020448311c4a7bb96aeb5c5db769f66812b13a50b5",
+                "credential_variant": "wrong-secret",
+                "ca_bundle_sha256": "sha256:fca046ca96fabdc57856c287f889f3a2a20dc3192abefa0443ae0e6505595fdf",
                 "returncode": 254,
                 "stdout": "",
                 "stderr": "An error occurred (AccessDenied) when calling DeleteObject",
