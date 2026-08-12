@@ -8,12 +8,18 @@ claimed to be a multi-host production object store.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 from pathlib import Path
+import re
 import sqlite3
-from typing import Any, Protocol, Optional, Union
+import ssl
+from typing import Any, Callable, Mapping, Protocol, Optional, Union
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,195 @@ class DirectoryBlobStore:
         data = self._path(digest).read_bytes()
         if self.digest(data) != digest:
             raise RuntimeError("artifact digest mismatch")
+        return data
+
+
+class EvidenceStoreError(RuntimeError):
+    """An external evidence-store request failed closed."""
+
+
+class S3CompatibleBlobStore:
+    """Content-addressed evidence blobs over the AWS S3 HTTP contract.
+
+    The adapter is provider-neutral: callers inject an AWS-compatible endpoint.
+    A local emulator can exercise this boundary at L2 SANDBOX, but adapter
+    existence is not evidence of a LIVE or PRODUCTION deployment.
+    """
+
+    _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+    _DIGEST_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        bucket: str,
+        region: str,
+        access_key: str,
+        secret_key: str,
+        session_token: str | None = None,
+        timeout: float = 10,
+        ssl_context: ssl.SSLContext | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        parsed = urlsplit(endpoint)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("endpoint must be an http(s) origin without credentials or query")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("endpoint must not contain a path")
+        if not self._BUCKET_RE.fullmatch(bucket):
+            raise ValueError("bucket must be a valid path-style S3 bucket name")
+        if not region.strip() or not access_key.strip() or not secret_key:
+            raise ValueError("region and credentials must be non-empty")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if parsed.scheme == "http" and ssl_context is not None:
+            raise ValueError("ssl_context requires an https endpoint")
+        self.endpoint = endpoint.rstrip("/")
+        self.bucket = bucket
+        self.region = region
+        self._access_key = access_key
+        self._secret_key = secret_key
+        self._session_token = session_token
+        self._timeout = timeout
+        self._ssl_context = ssl_context
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._host = parsed.netloc
+
+    @staticmethod
+    def digest(data: bytes) -> str:
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _hmac(key: bytes, value: str) -> bytes:
+        return hmac.new(key, value.encode(), hashlib.sha256).digest()
+
+    def _signed_headers(
+        self,
+        method: str,
+        path: str,
+        payload: bytes,
+        headers: Mapping[str, str],
+    ) -> dict[str, str]:
+        instant = self._clock()
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        instant = instant.astimezone(timezone.utc)
+        date = instant.strftime("%Y%m%d")
+        timestamp = instant.strftime("%Y%m%dT%H%M%SZ")
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        canonical_headers = {
+            "host": self._host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": timestamp,
+            **{name.lower(): " ".join(value.split()) for name, value in headers.items()},
+        }
+        if self._session_token is not None:
+            canonical_headers["x-amz-security-token"] = self._session_token
+        signed_names = ";".join(sorted(canonical_headers))
+        canonical_block = "".join(
+            f"{name}:{canonical_headers[name]}\n" for name in sorted(canonical_headers)
+        )
+        canonical_request = "\n".join(
+            (method, quote(path, safe="/-_.~"), "", canonical_block, signed_names, payload_hash)
+        )
+        scope = f"{date}/{self.region}/s3/aws4_request"
+        string_to_sign = "\n".join(
+            (
+                "AWS4-HMAC-SHA256",
+                timestamp,
+                scope,
+                hashlib.sha256(canonical_request.encode()).hexdigest(),
+            )
+        )
+        date_key = self._hmac(("AWS4" + self._secret_key).encode(), date)
+        region_key = self._hmac(date_key, self.region)
+        service_key = self._hmac(region_key, "s3")
+        signing_key = self._hmac(service_key, "aws4_request")
+        signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+        result = {name: value for name, value in headers.items()}
+        result.update(
+            {
+                "Host": self._host,
+                "X-Amz-Content-SHA256": payload_hash,
+                "X-Amz-Date": timestamp,
+                "Authorization": (
+                    f"AWS4-HMAC-SHA256 Credential={self._access_key}/{scope}, "
+                    f"SignedHeaders={signed_names}, Signature={signature}"
+                ),
+            }
+        )
+        if self._session_token is not None:
+            result["X-Amz-Security-Token"] = self._session_token
+        return result
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: bytes = b"",
+        headers: Mapping[str, str] | None = None,
+        allowed: tuple[int, ...] = (200,),
+    ) -> tuple[int, bytes]:
+        signed = self._signed_headers(method, path, payload, headers or {})
+        request = Request(self.endpoint + path, data=payload if method in {"PUT", "POST"} else None,
+                          headers=signed, method=method)
+        try:
+            with urlopen(request, timeout=self._timeout, context=self._ssl_context) as response:
+                status, body = response.status, response.read()
+        except HTTPError as exc:
+            with exc:
+                status, body = exc.code, exc.read()
+        except URLError as exc:
+            raise EvidenceStoreError(f"S3 {method} request failed: {exc.reason}") from exc
+        if status not in allowed:
+            raise EvidenceStoreError(f"S3 {method} request failed with HTTP {status}")
+        return status, body
+
+    def create_bucket(self) -> None:
+        self._request(
+            "PUT",
+            f"/{self.bucket}",
+            headers={"X-Amz-Bucket-Object-Lock-Enabled": "true"},
+        )
+
+    def _path(self, digest: str) -> str:
+        match = self._DIGEST_RE.fullmatch(digest)
+        if match is None:
+            raise ValueError("invalid sha256 digest")
+        value = match.group(1)
+        return f"/{self.bucket}/artifacts/{value[:2]}/{value[2:]}"
+
+    def put(self, data: bytes) -> ArtifactRecord:
+        digest = self.digest(data)
+        status, _ = self._request(
+            "PUT",
+            self._path(digest),
+            payload=data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "If-None-Match": "*",
+                "X-Amz-Meta-Sha256": digest.removeprefix("sha256:"),
+                "X-Amz-Object-Lock-Legal-Hold": "ON",
+            },
+            allowed=(200, 412),
+        )
+        if status == 412 and self.get(digest) != data:
+            raise EvidenceStoreError("content-address collision or corruption")
+        return ArtifactRecord(digest, len(data))
+
+    def get(self, digest: str) -> bytes:
+        _, data = self._request("GET", self._path(digest))
+        if self.digest(data) != digest:
+            raise EvidenceStoreError("artifact digest mismatch")
         return data
 
 
