@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -29,6 +30,13 @@ from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
 
 RUN_SCHEMA = "blackbox-floci-sandbox-run/v1"
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_AWS_ERROR_RE = re.compile(r"An error occurred \(([^)]+)\)")
+
+
+@dataclass(frozen=True)
+class AwsProbeOutcome:
+    status: str
+    detail: str
 
 
 def _run(
@@ -134,7 +142,7 @@ def _container_endpoint(name: str) -> str:
     return "https://127.0.0.1:" + mapping[0].rsplit(":", 1)[1]
 
 
-def _start_container(name: str, image_id: str, data_dir: Path) -> str:
+def _create_container(name: str, image_id: str, data_dir: Path | str) -> None:
     _run(
         "docker",
         "run",
@@ -160,7 +168,22 @@ def _start_container(name: str, image_id: str, data_dir: Path) -> str:
         image_id,
         cwd=ROOT,
     )
-    return _container_endpoint(name)
+
+
+def _evaluate_aws_probe(
+    result: subprocess.CompletedProcess[str],
+    expected_error_codes: set[str],
+) -> AwsProbeOutcome:
+    if result.returncode == 0:
+        return AwsProbeOutcome("accepted", "request-succeeded")
+    match = _AWS_ERROR_RE.search(result.stdout + result.stderr)
+    if match is not None and match.group(1) in expected_error_codes:
+        return AwsProbeOutcome("denied", match.group(1))
+    return AwsProbeOutcome("inconclusive", "unclassified-cli-error")
+
+
+def _security_decision(iam_probe: AwsProbeOutcome, signature_probe: AwsProbeOutcome) -> str:
+    return "pass" if iam_probe.status == signature_probe.status == "denied" else "quarantine"
 
 
 def _bootstrap_iam(endpoint: str, ca_bundle: Path, bucket: str) -> tuple[dict[str, str], dict[str, object]]:
@@ -262,6 +285,8 @@ def main() -> int:
     verification: dict[str, object] | None = None
     iam_delete_denied = False
     invalid_signature_denied = False
+    iam_probe = AwsProbeOutcome("not-run", "not-run")
+    signature_probe = AwsProbeOutcome("not-run", "not-run")
     policy: dict[str, object] = {}
     with tempfile.TemporaryDirectory(prefix="blackbox-floci-") as temporary:
         runtime = Path(temporary)
@@ -271,8 +296,9 @@ def main() -> int:
         ca_bundle = data_dir / "tls" / "floci-selfsigned.crt"
         try:
             print("starting strict Floci sandbox", flush=True)
-            endpoint = _start_container(container_name, image_id, data_dir)
+            _create_container(container_name, image_id, data_dir)
             container_created = True
+            endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
             print("bootstrapping restricted IAM principal", flush=True)
             credentials, policy = _bootstrap_iam(endpoint, ca_bundle, f"evidence-{commit[:12]}")
@@ -363,7 +389,8 @@ def main() -> int:
                 key,
                 check=False,
             )
-            iam_delete_denied = denied.returncode != 0 and "AccessDenied" in (denied.stderr + denied.stdout)
+            iam_probe = _evaluate_aws_probe(denied, {"AccessDenied", "AccessDeniedException"})
+            iam_delete_denied = iam_probe.status == "denied"
             wrong_credentials = {
                 "AWS_ACCESS_KEY_ID": credentials["AWS_ACCESS_KEY_ID"],
                 "AWS_SECRET_ACCESS_KEY": credentials["AWS_SECRET_ACCESS_KEY"] + "-wrong",
@@ -380,9 +407,11 @@ def main() -> int:
                 key,
                 check=False,
             )
-            invalid_signature_denied = bad_signature.returncode != 0
-            if not iam_delete_denied:
-                raise RuntimeError("Floci IAM delete planted-negative did not fail closed")
+            signature_probe = _evaluate_aws_probe(
+                bad_signature,
+                {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
+            )
+            invalid_signature_denied = signature_probe.status == "denied"
         finally:
             if container_created:
                 _run("docker", "rm", "--force", container_name, cwd=ROOT, check=False)
@@ -391,13 +420,17 @@ def main() -> int:
     if verification is None or teardown != "container-absent":
         raise RuntimeError("Floci sandbox did not produce verified evidence and teardown")
     finished_at = datetime.now(timezone.utc).isoformat()
+    security_decision = _security_decision(iam_probe, signature_probe)
+    verified_scope = ["S3 content-addressed round-trip", "WAL restart", "fresh-process retrieval"]
+    if iam_delete_denied:
+        verified_scope.append("IAM delete deny")
     receipt = {
         "schema": RUN_SCHEMA,
         "provider_kind": "floci-emulator",
         "maturity": "L2 SANDBOX",
         "production_claim_allowed": False,
-        "decision": "verified" if invalid_signature_denied else "quarantine",
-        "verified_scope": "S3 content-addressed round-trip, WAL restart, fresh-process retrieval, IAM delete deny",
+        "decision": "verified" if security_decision == "pass" else "quarantine",
+        "verified_scope": verified_scope,
         "run_id": args.run_id,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -406,12 +439,14 @@ def main() -> int:
         "storage_mode": "wal",
         "tls": "pinned-self-signed-certificate",
         "sigv4_configuration": "enabled",
-        "sigv4_wrong_secret": "denied" if invalid_signature_denied else "accepted",
+        "sigv4_wrong_secret": signature_probe.status,
         "iam_enforcement": "enabled",
-        "security_decision": "pass" if invalid_signature_denied else "quarantine",
+        "security_decision": security_decision,
         "restart_reverification": "verified",
         "iam_delete_denied": iam_delete_denied,
         "invalid_signature_denied": invalid_signature_denied,
+        "iam_delete_probe": iam_probe.__dict__,
+        "invalid_signature_probe": signature_probe.__dict__,
         "teardown": teardown,
         "verification": verification,
         "limitations": [
@@ -431,7 +466,7 @@ def main() -> int:
             sort_keys=True,
         )
     )
-    return 0 if invalid_signature_denied else 3
+    return 0 if security_decision == "pass" else 3
 
 
 if __name__ == "__main__":

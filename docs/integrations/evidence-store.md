@@ -39,7 +39,13 @@ to `provider_kind=floci-emulator`, `maturity=L2 SANDBOX`, and
 `production_claim_allowed=false`. A wrong-secret planted negative that is accepted
 produces a `quarantine` receipt and a non-zero exit code.
 
-At Floci commit `c21337c3b185ab0c436cdfbc2bede70dadc8330c`, source inspection found
+At Floci commit `c21337c3b185ab0c436cdfbc2bede70dadc8330c`, a diagnostic run
+reached S3 write/read, WAL restart and fresh-process retrieval before its combined
+security probe failed. The wrong-secret path was identified as permissive by source
+inspection, but the three-attempt stop-loss prevented a final post-fix receipt.
+Those observations are not a completed qualification or maturity advance.
+
+Source inspection also found
 that `FLOCI_AUTH_VALIDATE_SIGNATURES` is consumed for pre-signed URL handling but
 does not establish a regular Authorization-header SigV4 validation filter. The
 configuration flag must therefore never be reported as proof of request-signature

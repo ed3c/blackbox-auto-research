@@ -39,6 +39,18 @@ def _timestamp(clock: Callable[[], datetime]) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _parse_timestamp(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} must include a UTC offset")
+    return parsed.astimezone(timezone.utc)
+
+
 def _require_digest(value: str, name: str) -> None:
     if not _DIGEST_RE.fullmatch(value):
         raise ValueError(f"{name} must be sha256:<64 lowercase hex chars>")
@@ -64,6 +76,8 @@ class FlociEnvironment:
             raise ValueError("Floci sandbox evidence requires an https endpoint")
         if self.tls_trust != "pinned-self-signed-certificate":
             raise ValueError("Floci sandbox evidence requires a pinned TLS certificate")
+        if type(self.sigv4_validation_configured) is not bool or type(self.iam_enforcement) is not bool:
+            raise ValueError("Floci control flags must be boolean")
         if not self.sigv4_validation_configured or not self.iam_enforcement:
             raise ValueError("Floci sandbox evidence requires SigV4 configuration and IAM enforcement")
 
@@ -235,6 +249,13 @@ def verify_floci_evidence(
         raise ValueError("maturity must remain L2 SANDBOX")
     if manifest.get("production_claim_allowed") is not False:
         raise ValueError("production claim must remain disabled")
+    produced_at = _parse_timestamp(manifest.get("produced_at"), "produced_at")
+    verification_time = (clock or (lambda: datetime.now(timezone.utc)))()
+    if verification_time.tzinfo is None or verification_time.utcoffset() is None:
+        raise ValueError("clock must return a timezone-aware datetime")
+    verification_time = verification_time.astimezone(timezone.utc)
+    if produced_at > verification_time:
+        raise ValueError("produced_at is later than verification time")
     if manifest.get("environment") != asdict(expected_environment):
         raise ValueError("Floci environment identity drift")
     if manifest.get("identities") != expected_identity.manifest_identities(expected_environment):
@@ -288,5 +309,5 @@ def verify_floci_evidence(
             "configured emulator controls require planted-negative outcome verification",
             "managed KMS/HSM, multi-host metadata, backup/restore, and L4 controls remain unproven",
         ],
-        "verified_at": _timestamp(clock or (lambda: datetime.now(timezone.utc))),
+        "verified_at": verification_time.isoformat(),
     }

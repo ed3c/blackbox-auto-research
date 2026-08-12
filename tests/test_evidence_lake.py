@@ -95,6 +95,18 @@ class _MemoryBlobStore:
 
 
 class EvidenceLakeTests(unittest.TestCase):
+    def test_floci_environment_rejects_string_boolean_flags(self):
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            FlociEnvironment(
+                commit="a" * 40,
+                image_id="sha256:" + "b" * 64,
+                storage_mode="wal",
+                endpoint_scheme="https",
+                tls_trust="pinned-self-signed-certificate",
+                sigv4_validation_configured="false",  # type: ignore[arg-type]
+                iam_enforcement=True,
+            )
+
     def test_floci_receipt_is_l2_only_and_rejects_a_production_relabel(self):
         store = _MemoryBlobStore()
         environment = FlociEnvironment(
@@ -146,6 +158,27 @@ class EvidenceLakeTests(unittest.TestCase):
                 verifier_pid=202,
             )
 
+        malformed_time = {**manifest, "produced_at": "not-a-timestamp"}
+        with self.assertRaisesRegex(ValueError, "produced_at"):
+            verify_floci_evidence(
+                store,
+                malformed_time,
+                expected_environment=environment,
+                expected_identity=identity,
+                verifier_pid=202,
+            )
+
+        future_time = {**manifest, "produced_at": "2026-08-13T00:00:00+00:00"}
+        with self.assertRaisesRegex(ValueError, "later than verification"):
+            verify_floci_evidence(
+                store,
+                future_time,
+                expected_environment=environment,
+                expected_identity=identity,
+                verifier_pid=202,
+                clock=lambda: datetime(2026, 8, 12, tzinfo=timezone.utc),
+            )
+
     def test_s3_compatible_store_round_trips_content_addressed_blob_with_sigv4(self):
         with _S3Server() as endpoint:
             store = S3CompatibleBlobStore(
@@ -170,6 +203,38 @@ class EvidenceLakeTests(unittest.TestCase):
                     "AWS4-HMAC-SHA256 Credential=sandbox-access/20260812/us-east-1/s3/aws4_request, "
                 )
             )
+
+    def test_sigv4_signing_matches_botocore_derived_golden_vector(self):
+        store = S3CompatibleBlobStore(
+            endpoint="http://example.test",
+            bucket="evidence",
+            region="us-east-1",
+            access_key="sandbox-access",
+            secret_key="sandbox-secret",
+            clock=lambda: datetime(2026, 8, 12, tzinfo=timezone.utc),
+        )
+        payload = b"verified-outcome"
+        digest = store.digest(payload).removeprefix("sha256:")
+        headers = store._signed_headers(
+            "PUT",
+            f"/evidence/artifacts/{digest[:2]}/{digest[2:]}",
+            payload,
+            {
+                "Content-Type": "application/octet-stream",
+                "If-None-Match": "*",
+                "X-Amz-Meta-Sha256": digest,
+                "X-Amz-Object-Lock-Legal-Hold": "ON",
+            },
+        )
+
+        self.assertEqual(
+            headers["Authorization"],
+            "AWS4-HMAC-SHA256 "
+            "Credential=sandbox-access/20260812/us-east-1/s3/aws4_request, "
+            "SignedHeaders=content-type;host;if-none-match;x-amz-content-sha256;"
+            "x-amz-date;x-amz-meta-sha256;x-amz-object-lock-legal-hold, "
+            "Signature=018b7527c9ca3530c4d910d6b530f72bed346ea45e84ac0ef0b7fac35c0a91ac",
+        )
 
     def test_fresh_process_style_reopen_verifies_signed_chain_and_blob(self):
         with tempfile.TemporaryDirectory() as tmp:

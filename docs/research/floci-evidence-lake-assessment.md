@@ -28,3 +28,13 @@ The same adapter/harness must later run against an authorized external object
 store, production metadata/index service and managed KMS/HSM, with multi-host,
 backup/restore, retention and fresh-worker receipts, before #25 can advance to
 `L4 PRODUCTION`.
+
+## Local execution outcome
+
+The local clone reached S3 write/read, WAL restart and fresh-process retrieval
+before a combined security probe failed. Source inspection showed no regular
+Authorization-header validation path for the configured SigV4 flag; however, no
+final receipt was produced before the three-attempt stop-loss. This is a blocker,
+not a successful Floci qualification. The checked-in runner now classifies only
+explicit AWS signature error codes as denial, records other errors as
+inconclusive, writes a quarantine receipt, and exits non-zero.
