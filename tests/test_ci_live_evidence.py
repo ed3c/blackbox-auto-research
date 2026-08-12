@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -204,11 +205,20 @@ class CILiveEvidenceTests(unittest.TestCase):
 
     def test_workflow_pins_actions_and_separates_verifier_job(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "live-ci-evidence.yml").read_text()
+        artifact_actions = re.findall(
+            r"uses:\s+(actions/(?:upload|download)-artifact@\S+)", workflow
+        )
 
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("verify:\n    needs: produce", workflow)
-        self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", workflow)
-        self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", workflow)
+        self.assertEqual(
+            artifact_actions,
+            [
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+                "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            ],
+        )
         self.assertIn("--tamper-probe", workflow)
 
 
