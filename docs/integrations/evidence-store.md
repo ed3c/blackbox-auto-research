@@ -46,11 +46,11 @@ The receipt records child locators, SHA-256 digests, sizes and a reproduction
 command whose `FLOCI_REPO` contract is pinned to the source commit and whose
 `NEW_ARTIFACTS_DIR` must not already exist.
 
-Run `floci-sandbox-20260812-09` against clean Floci commit
+Run `floci-sandbox-20260812-10` against clean Floci commit
 `c21337c3b185ab0c436cdfbc2bede70dadc8330c` and image
 `sha256:44a4120fc38df1a94da34dbdcf3705f9c877b33fd9f224a986d3f973bf9d85fd`
 published a replayable quarantine bundle under
-`evidence/floci/floci-sandbox-20260812-09/`. It verified S3 content-addressed
+`evidence/floci/floci-sandbox-20260812-10/`. It verified S3 content-addressed
 round-trip, WAL restart, fresh-process retrieval and IAM delete denial. The
 wrong-secret Authorization-header `HeadObject` succeeded, so Floci is not
 qualified and #25 does not advance. The enforcement gap remains open as #56.
@@ -62,6 +62,8 @@ Run `floci-sandbox-20260812-07` is superseded because phase targets were not yet
 attested by both the producer manifest and fresh verifier receipt.
 Run `floci-sandbox-20260812-08` is superseded because the worker did not yet
 cross-check its actual endpoint and CA bytes against the attested phase target.
+Run `floci-sandbox-20260812-09` is superseded because its CA attestation still
+re-read a provider-writable path instead of using a runner-owned immutable snapshot.
 
 The exact runner invocation is recorded as `reproduction_command` in the final
 receipt. `FLOCI_REPO` must be a clean checkout at the pinned commit and
@@ -69,16 +71,16 @@ receipt. `FLOCI_REPO` must be a clean checkout at the pinned commit and
 
 ```bash
 python3 scripts/verify_floci_sandbox_bundle.py \
-  --receipt evidence/floci/floci-sandbox-20260812-09/runner-receipt.json
+  --receipt evidence/floci/floci-sandbox-20260812-10/runner-receipt.json
 ```
 
 Artifact SHA-256 digests:
 
 - IAM policy: `7d5d46fefc0762f3cdea35fe4d218a21cbcfee46b50a9a4bc1820fad77b95c70`;
-- input payload: `5fb8a02e91c3517f7861be69b0720ab05472244cd6d7f3aea3569a75c8cce79e`;
-- producer manifest: `4c0f7b20216016dae1c2b46555d2ff3ca6163edfbde922242adaa7db486f1329`;
-- fresh-process verifier receipt: `14443e852fdd750a66f8ea90f3f90c72493bbb5c82dda6ed4d1bd02dedb95c96`;
-- final runner receipt: `889f3974f1d670d7c6ce78317180ffac8aa3fd5658f5fddc71d647719b86f348`.
+- input payload: `da3f4ffac5da5a30f9d42807ddb5fd76123d0111c4269d5d6257a9190d349030`;
+- producer manifest: `b13f3006788aeec469a855484d1281515d9a967971893d325b90ae272f4420bb`;
+- fresh-process verifier receipt: `f9d849c809f0f5dcbcfc6bd9871c687b51c7da7512dfeeb58919de4f4c92b4b1`;
+- final runner receipt: `3367fc734b415618ec11bfa39ead7324696b016949a9eefe9d43eba73a761bd0`.
 
 Source inspection also found
 that `FLOCI_AUTH_VALIDATE_SIGNATURES` is consumed for pre-signed URL handling but

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from blackbox_autoresearch.evidence_lake import (
     ArtifactRecord,
@@ -139,9 +140,22 @@ class EvidenceLakeTests(unittest.TestCase):
             path = root / "config.json"
             path.write_text(json.dumps(config), encoding="utf-8")
 
-            self.assertEqual(FlociWorkerConfig.load(path).phase_target.endpoint, target["endpoint"])
+            loaded = FlociWorkerConfig.load(path)
+            self.assertEqual(loaded.phase_target.endpoint, target["endpoint"])
+            ca_bundle.write_bytes(b"changed-after-load")
+            with patch(
+                "blackbox_autoresearch.floci_evidence_store.ssl.create_default_context"
+            ) as context:
+                loaded.store(
+                    {
+                        "AWS_ACCESS_KEY_ID": "fixture-key",
+                        "AWS_SECRET_ACCESS_KEY": "fixture-secret",
+                    }
+                )
+            context.assert_called_once_with(cadata="fixture-ca")
 
             config["endpoint"] = "https://127.0.0.1:4567"
+            ca_bundle.write_bytes(b"fixture-ca")
             path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "endpoint"):
                 FlociWorkerConfig.load(path)

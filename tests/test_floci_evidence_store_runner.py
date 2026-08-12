@@ -20,11 +20,26 @@ from scripts.run_floci_evidence_store_sandbox import (
     _reproduction_metadata,
     _run_with_artifact_reservation,
     _security_decision,
+    _snapshot_ca,
     _validate_output_paths,
 )
 
 
 class FlociEvidenceStoreRunnerTests(unittest.TestCase):
+    def test_ca_snapshot_is_runner_owned_and_independent_from_provider_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "provider-ca.pem"
+            destination = root / "snapshot.pem"
+            source.write_bytes(b"provider-ca")
+
+            snapshot, payload = _snapshot_ca(source, destination)
+            source.write_bytes(b"provider-mutated")
+
+            self.assertEqual(payload, b"provider-ca")
+            self.assertEqual(snapshot.read_bytes(), b"provider-ca")
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o400)
+
     def test_run_and_verifier_schema_changes_are_explicit(self):
         self.assertEqual(RUN_SCHEMA, "blackbox-floci-sandbox-run/v3")
         self.assertEqual(

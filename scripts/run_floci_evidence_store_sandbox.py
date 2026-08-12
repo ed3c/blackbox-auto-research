@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import stat
 from typing import Callable, TypeVar
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -147,6 +148,25 @@ def _write_json(path: Path, value: object) -> None:
         handle.write("\n")
 
 
+def _snapshot_ca(source: Path, destination: Path) -> tuple[Path, bytes]:
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > 1024 * 1024:
+            raise ValueError("Floci CA source must be a bounded regular file")
+        payload = bytearray()
+        while chunk := os.read(descriptor, 65536):
+            payload.extend(chunk)
+            if len(payload) > 1024 * 1024:
+                raise ValueError("Floci CA source exceeds size limit")
+    finally:
+        os.close(descriptor)
+    with destination.open("xb") as handle:
+        handle.write(payload)
+    destination.chmod(0o400)
+    return destination, bytes(payload)
+
+
 def _export_evidence_file(source: Path, destination: Path) -> dict[str, object]:
     if not source.is_file() or source.is_symlink():
         raise ValueError(f"evidence source must be a regular file: {source.name}")
@@ -265,6 +285,7 @@ def _aws(
     *args: str,
     check: bool = True,
 ) -> AwsExecution:
+    ca_bundle_bytes = _read_snapshot_ca(ca_bundle)
     environment = {
         **os.environ,
         **credentials.environment(),
@@ -286,7 +307,7 @@ def _aws(
     return AwsExecution(
         result=result,
         endpoint=endpoint,
-        ca_bundle_sha256=_digest_bytes(ca_bundle.read_bytes()),
+        ca_bundle_sha256=_digest_bytes(ca_bundle_bytes),
         principal_access_key_sha256=_digest_bytes(
             credentials.access_key_id.encode()
         ),
@@ -301,8 +322,22 @@ def _container_endpoint(name: str) -> str:
     return "https://127.0.0.1:" + mapping[0].rsplit(":", 1)[1]
 
 
+def _read_snapshot_ca(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > 1024 * 1024:
+            raise ValueError("runner CA snapshot must be a bounded regular file")
+        payload = os.read(descriptor, 1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            raise ValueError("runner CA snapshot exceeds size limit")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def _container_target(
-    name: str, endpoint: str, ca_bundle: Path, expected_image_id: str
+    name: str, endpoint: str, ca_bundle_bytes: bytes, expected_image_id: str
 ) -> FlociPhaseTarget:
     value = _run(
         "docker", "inspect", name, "--format", "{{.Id}} {{.Image}}", cwd=ROOT
@@ -313,7 +348,7 @@ def _container_target(
         container_id=value[0],
         image_id=value[1],
         endpoint=endpoint,
-        ca_bundle_sha256=_digest_bytes(ca_bundle.read_bytes()),
+        ca_bundle_sha256=_digest_bytes(ca_bundle_bytes),
     )
 
 
@@ -520,17 +555,19 @@ def _execute(
         data_dir.mkdir()
         data_dir.chmod(0o777)
         ca_bundle = data_dir / "tls" / "floci-selfsigned.crt"
+        ca_snapshot = runtime / "floci-ca-snapshot.pem"
         try:
             print("starting strict Floci sandbox", flush=True)
             _create_container(container_name, image_id, data_dir)
             container_created = True
             endpoint = _container_endpoint(container_name)
             _wait_container_ready(container_name, endpoint, ca_bundle)
+            ca_snapshot, ca_snapshot_bytes = _snapshot_ca(ca_bundle, ca_snapshot)
             producer_phase_target = _container_target(
-                container_name, endpoint, ca_bundle, image_id
+                container_name, endpoint, ca_snapshot_bytes, image_id
             )
             print("bootstrapping restricted IAM principal", flush=True)
-            credentials, policy = _bootstrap_iam(endpoint, ca_bundle, f"evidence-{commit[:12]}")
+            credentials, policy = _bootstrap_iam(endpoint, ca_snapshot, f"evidence-{commit[:12]}")
             identity = FlociEvidenceIdentity(
                 run_id=args.run_id,
                 task_digest=_digest_bytes(b"floci-s3-content-addressed-round-trip/v1"),
@@ -550,7 +587,7 @@ def _execute(
                 "endpoint": endpoint,
                 "bucket": f"evidence-{commit[:12]}",
                 "region": "us-east-1",
-                "ca_bundle": str(ca_bundle),
+                "ca_bundle": str(ca_snapshot),
                 "environment": environment.__dict__,
                 "producer_phase_target": producer_phase_target.__dict__,
                 "phase_target": producer_phase_target.__dict__,
@@ -589,9 +626,9 @@ def _execute(
             stopped = _run("docker", "stop", container_name, cwd=ROOT)
             restarted = _run("docker", "start", container_name, cwd=ROOT)
             endpoint = _container_endpoint(container_name)
-            _wait_container_ready(container_name, endpoint, ca_bundle)
+            _wait_container_ready(container_name, endpoint, ca_snapshot)
             verifier_phase_target = _container_target(
-                container_name, endpoint, ca_bundle, image_id
+                container_name, endpoint, ca_snapshot_bytes, image_id
             )
             verifier_config = {
                 **config,
@@ -624,7 +661,7 @@ def _execute(
             key = f"artifacts/{artifact_digest[:2]}/{artifact_digest[2:]}"
             denied = _aws(
                 endpoint,
-                ca_bundle,
+                ca_snapshot,
                 credentials,
                 "s3api",
                 "delete-object",
@@ -644,7 +681,7 @@ def _execute(
             wrong_credentials = credentials.wrong_secret()
             bad_signature = _aws(
                 endpoint,
-                ca_bundle,
+                ca_snapshot,
                 wrong_credentials,
                 "s3api",
                 "head-object",

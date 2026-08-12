@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import ssl
+import stat
 from typing import Callable, Mapping
 from urllib.parse import urlparse
 
@@ -36,6 +37,24 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _read_regular_file(path: Path, name: str, *, maximum: int = 1024 * 1024) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{name} must be a regular file")
+        if status.st_size > maximum:
+            raise ValueError(f"{name} exceeds size limit")
+        payload = bytearray()
+        while chunk := os.read(descriptor, 65536):
+            payload.extend(chunk)
+            if len(payload) > maximum:
+                raise ValueError(f"{name} exceeds size limit")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
 
 
 def _timestamp(clock: Callable[[], datetime]) -> str:
@@ -168,6 +187,7 @@ class FlociWorkerConfig:
     producer_phase_target: FlociPhaseTarget
     phase_target: FlociPhaseTarget
     identity: FlociEvidenceIdentity
+    ca_bundle_pem: bytes = field(repr=False)
 
     @classmethod
     def load(cls, path: Path) -> "FlociWorkerConfig":
@@ -193,21 +213,22 @@ class FlociWorkerConfig:
         )
         phase_target = _require_mapping(value.get("phase_target"), "phase_target")
         identity = _require_mapping(value.get("identity"), "identity")
+        ca_bundle = Path(str(value["ca_bundle"]))
+        ca_bundle_pem = _read_regular_file(ca_bundle, "worker CA bundle")
         try:
             result = cls(
                 endpoint=str(value["endpoint"]),
                 bucket=str(value["bucket"]),
                 region=str(value["region"]),
-                ca_bundle=Path(str(value["ca_bundle"])),
+                ca_bundle=ca_bundle,
                 environment=FlociEnvironment(**environment),
                 producer_phase_target=FlociPhaseTarget(**producer_phase_target),
                 phase_target=FlociPhaseTarget(**phase_target),
                 identity=FlociEvidenceIdentity(**identity),
+                ca_bundle_pem=ca_bundle_pem,
             )
         except TypeError as exc:
             raise ValueError(f"worker config fields drift: {exc}") from exc
-        if not result.ca_bundle.is_file() or result.ca_bundle.is_symlink():
-            raise ValueError("worker CA bundle must be a regular file")
         if result.endpoint != result.phase_target.endpoint:
             raise ValueError("worker endpoint does not match current phase target")
         if result.environment.image_id != result.phase_target.image_id:
@@ -220,7 +241,7 @@ class FlociWorkerConfig:
             != result.phase_target.ca_bundle_sha256
         ):
             raise ValueError("worker phase target identity drift")
-        if _digest(result.ca_bundle.read_bytes()) != result.phase_target.ca_bundle_sha256:
+        if _digest(result.ca_bundle_pem) != result.phase_target.ca_bundle_sha256:
             raise ValueError("worker CA bundle digest mismatch")
         return result
 
@@ -230,7 +251,11 @@ class FlociWorkerConfig:
         secret_key = credentials.get("AWS_SECRET_ACCESS_KEY", "")
         if not access_key or not secret_key:
             raise ValueError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required")
-        context = ssl.create_default_context(cafile=str(self.ca_bundle))
+        try:
+            ca_data = self.ca_bundle_pem.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("worker CA bundle must be ASCII PEM") from exc
+        context = ssl.create_default_context(cadata=ca_data)
         return S3CompatibleBlobStore(
             endpoint=self.endpoint,
             bucket=self.bucket,

@@ -249,13 +249,13 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
     def test_replays_the_committed_quarantine_bundle(self) -> None:
         receipt = (
             ROOT
-            / "evidence/floci/floci-sandbox-20260812-09/runner-receipt.json"
+            / "evidence/floci/floci-sandbox-20260812-10/runner-receipt.json"
         )
 
         result = self.run_verifier(receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"run_id": "floci-sandbox-20260812-09"', result.stdout)
+        self.assertIn('"run_id": "floci-sandbox-20260812-10"', result.stdout)
         self.assertIn('"decision": "quarantine"', result.stdout)
 
     def test_rejects_a_tampered_child_before_semantic_replay(self) -> None:
