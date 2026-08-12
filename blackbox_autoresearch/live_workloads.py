@@ -12,6 +12,7 @@ import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -170,20 +171,31 @@ def run_sqlite_etl_workload() -> WorkloadEvidence:
         )
 
 
-def run_ci_remediation_workload() -> WorkloadEvidence:
+def run_ci_remediation_workload(*, disable_bytecode_cache: bool = True) -> WorkloadEvidence:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         test_file = root / "test_target.py"
-        test_command = [sys.executable, "-B", "-m", "unittest", "-q"]
-        test_file.write_text(
+        test_command = [sys.executable]
+        if disable_bytecode_cache:
+            test_command.append("-B")
+        test_command.extend(("-m", "unittest", "-q"))
+        fixed_timestamp_ns = 1_700_000_000_000_000_000
+        seeded_source = (
             "import unittest\n\nclass T(unittest.TestCase):\n"
             "    def test_value(self): print('seeded'); self.assertEqual(1 + 1, 3)\n"
         )
-        failing = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
-        test_file.write_text(
+        repaired_source = (
             "import unittest\n\nclass T(unittest.TestCase):\n"
             "    def test_value(self): print('repair'); self.assertEqual(1 + 1, 2)\n"
         )
+        if len(seeded_source.encode()) != len(repaired_source.encode()):
+            raise ValueError("CI remediation fixtures must have equal byte lengths")
+
+        test_file.write_text(seeded_source)
+        os.utime(test_file, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
+        failing = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
+        test_file.write_text(repaired_source)
+        os.utime(test_file, ns=(fixed_timestamp_ns, fixed_timestamp_ns))
         repaired = subprocess.run(test_command, cwd=root, capture_output=True, text=True)
         cache_absent = not (root / "__pycache__").exists()
         data = test_file.read_bytes()
@@ -199,6 +211,7 @@ def run_ci_remediation_workload() -> WorkloadEvidence:
             and cache_absent,
             {
                 "bytecode_cache_absent": str(cache_absent).lower(),
+                "bytecode_cache_disabled": str(disable_bytecode_cache).lower(),
                 "repaired": str(repaired.returncode == 0).lower(),
                 "repaired_source": repaired.stdout.strip(),
                 "seeded_failure": str(failing.returncode == 1).lower(),

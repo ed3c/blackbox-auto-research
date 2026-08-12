@@ -40,6 +40,14 @@ class LiveWorkloadTests(unittest.TestCase):
         self.assertEqual("repair", evidence.metadata["repaired_source"])
         self.assertEqual("true", evidence.metadata["bytecode_cache_absent"])
 
+    def test_ci_remediation_deterministically_reproduces_stale_bytecode(self) -> None:
+        evidence = run_ci_remediation_workload(disable_bytecode_cache=False)
+
+        self.assertFalse(evidence.passed)
+        self.assertEqual("seeded", evidence.metadata["seeded_source"])
+        self.assertEqual("seeded", evidence.metadata["repaired_source"])
+        self.assertEqual("false", evidence.metadata["bytecode_cache_absent"])
+
     def test_differential_verifier_detects_seeded_regression(self) -> None:
         baseline = lambda value: value * 2
         seeded_regression = lambda value: value * 2 + (1 if value == 3 else 0)
