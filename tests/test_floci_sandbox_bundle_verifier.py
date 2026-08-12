@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+
+from blackbox_autoresearch.floci_evidence_store import VERIFICATION_LIMITATIONS
+from scripts.run_floci_evidence_store_sandbox import RUN_LIMITATIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,7 +100,7 @@ def build_quarantine_bundle(root: Path) -> Path:
         "verifier_pid": 102,
         "process_separation": "verified",
         "local_digest_negative": "detected",
-        "limitations": ["fixture"],
+        "limitations": list(VERIFICATION_LIMITATIONS),
         "verified_at": "2026-08-12T00:00:02+00:00",
     }
     children = {
@@ -114,6 +118,11 @@ def build_quarantine_bundle(root: Path) -> Path:
             "size": len(child),
         }
     iam_stderr = "An error occurred (AccessDenied) when calling DeleteObject"
+    endpoint = "https://127.0.0.1:4566"
+    bucket = "evidence-aaaaaaaaaaaa"
+    artifact_hex = digest_bytes(payload_bytes).removeprefix("sha256:")
+    key = f"artifacts/{artifact_hex[:2]}/{artifact_hex[2:]}"
+    principal_digest = digest_bytes(b"fixture-access-key")
     receipt = {
         "schema": "blackbox-floci-sandbox-run/v2",
         "provider_kind": "floci-emulator",
@@ -146,6 +155,11 @@ def build_quarantine_bundle(root: Path) -> Path:
         "invalid_signature_denied": False,
         "iam_delete_probe": {
             "operation": "s3-delete-object",
+            "argv": [
+                "aws", "--endpoint-url", endpoint, "--ca-bundle", "$RUN_CA_BUNDLE",
+                "s3api", "delete-object", "--bucket", bucket, "--key", key,
+            ],
+            "principal_access_key_sha256": principal_digest,
             "returncode": 254,
             "stdout": "",
             "stderr": iam_stderr,
@@ -153,6 +167,11 @@ def build_quarantine_bundle(root: Path) -> Path:
         },
         "invalid_signature_probe": {
             "operation": "s3-head-object-with-wrong-secret",
+            "argv": [
+                "aws", "--endpoint-url", endpoint, "--ca-bundle", "$RUN_CA_BUNDLE",
+                "s3api", "head-object", "--bucket", bucket, "--key", key,
+            ],
+            "principal_access_key_sha256": principal_digest,
             "returncode": 0,
             "stdout": "{}\n",
             "stderr": "",
@@ -166,7 +185,7 @@ def build_quarantine_bundle(root: Path) -> Path:
         },
         "verification": verification,
         "evidence_artifacts": artifact_records,
-        "limitations": ["fixture"],
+        "limitations": list(RUN_LIMITATIONS),
         "reproduction_command": [
             "python3",
             "scripts/run_floci_evidence_store_sandbox.py",
@@ -190,6 +209,9 @@ def build_quarantine_bundle(root: Path) -> Path:
 
 
 class FlociSandboxBundleVerifierTests(unittest.TestCase):
+    def temporary_directory(self) -> tempfile.TemporaryDirectory[str]:
+        return tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
+
     def run_verifier(self, receipt: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["python3", str(VERIFIER), "--receipt", str(receipt)],
@@ -199,7 +221,7 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
         )
 
     def test_replays_a_complete_quarantine_bundle_without_network(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with self.temporary_directory() as raw:
             receipt = build_quarantine_bundle(Path(raw))
 
             result = self.run_verifier(receipt)
@@ -211,17 +233,17 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
     def test_replays_the_committed_quarantine_bundle(self) -> None:
         receipt = (
             ROOT
-            / "evidence/floci/floci-sandbox-20260812-04/runner-receipt.json"
+            / "evidence/floci/floci-sandbox-20260812-05/runner-receipt.json"
         )
 
         result = self.run_verifier(receipt)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"run_id": "floci-sandbox-20260812-04"', result.stdout)
+        self.assertIn('"run_id": "floci-sandbox-20260812-05"', result.stdout)
         self.assertIn('"decision": "quarantine"', result.stdout)
 
     def test_rejects_a_tampered_child_before_semantic_replay(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with self.temporary_directory() as raw:
             root = Path(raw)
             receipt = build_quarantine_bundle(root)
             manifest = root / "producer-manifest.json"
@@ -235,7 +257,7 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
         self.assertIn("producer manifest digest mismatch", result.stderr)
 
     def test_rejects_provenance_drift_even_when_child_digest_is_updated(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with self.temporary_directory() as raw:
             root = Path(raw)
             receipt_path = build_quarantine_bundle(root)
             manifest_path = root / "producer-manifest.json"
@@ -254,7 +276,7 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
         self.assertIn("provenance identity mismatch", result.stderr)
 
     def test_rejects_a_probe_classification_that_disagrees_with_raw_output(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with self.temporary_directory() as raw:
             root = Path(raw)
             receipt_path = build_quarantine_bundle(root)
             receipt = json.loads(receipt_path.read_bytes())
@@ -268,6 +290,51 @@ class FlociSandboxBundleVerifierTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("outcome replay mismatch", result.stderr)
+
+    def test_rejects_probe_target_drift(self) -> None:
+        with self.temporary_directory() as raw:
+            root = Path(raw)
+            receipt_path = build_quarantine_bundle(root)
+            receipt = json.loads(receipt_path.read_bytes())
+            receipt["iam_delete_probe"]["argv"][-1] = "artifacts/wrong"
+            write_json(receipt_path, receipt)
+
+            result = self.run_verifier(receipt_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("probe argv mismatch", result.stderr)
+
+    def test_rejects_scope_or_limitations_drift(self) -> None:
+        for field, value in (
+            ("verified_scope", ["L4 production storage"]),
+            ("limitations", []),
+        ):
+            with self.subTest(field=field), self.temporary_directory() as raw:
+                root = Path(raw)
+                receipt_path = build_quarantine_bundle(root)
+                receipt = json.loads(receipt_path.read_bytes())
+                receipt[field] = value
+                write_json(receipt_path, receipt)
+
+                result = self.run_verifier(receipt_path)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(f"{field} mismatch", result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_rejects_a_bundle_under_a_symlinked_ancestor(self) -> None:
+        with self.temporary_directory() as raw:
+            root = Path(raw)
+            real = root / "real"
+            real.mkdir()
+            build_quarantine_bundle(real)
+            link = root / "linked"
+            link.symlink_to(real, target_is_directory=True)
+
+            result = self.run_verifier(link / "runner-receipt.json")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symlink", result.stderr)
 
 
 if __name__ == "__main__":

@@ -188,7 +188,7 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
 
     def test_probe_receipt_preserves_raw_result_and_classification(self):
         result = subprocess.CompletedProcess(
-            ("aws",),
+            ("aws", "--ca-bundle", "/tmp/ca.pem", "s3api", "delete-object"),
             254,
             "",
             "An error occurred (AccessDenied) when calling DeleteObject",
@@ -196,9 +196,17 @@ class FlociEvidenceStoreRunnerTests(unittest.TestCase):
         outcome = _evaluate_aws_probe(result, {"AccessDenied"})
 
         self.assertEqual(
-            _probe_receipt("s3-delete-object", result, outcome),
+            _probe_receipt("s3-delete-object", result, outcome, "fixture-key"),
             {
                 "operation": "s3-delete-object",
+                "argv": [
+                    "aws",
+                    "--ca-bundle",
+                    "$RUN_CA_BUNDLE",
+                    "s3api",
+                    "delete-object",
+                ],
+                "principal_access_key_sha256": "sha256:66e7c82b49bb291dd09c8e020448311c4a7bb96aeb5c5db769f66812b13a50b5",
                 "returncode": 254,
                 "stdout": "",
                 "stderr": "An error occurred (AccessDenied) when calling DeleteObject",

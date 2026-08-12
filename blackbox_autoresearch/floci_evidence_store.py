@@ -20,6 +20,11 @@ VERIFICATION_SCHEMA = "blackbox-floci-evidence-store-verification/v2"
 PROVIDER_KIND = "floci-emulator"
 MATURITY = "L2 SANDBOX"
 WORKER_CONFIG_SCHEMA = "blackbox-floci-worker-config/v1"
+VERIFICATION_LIMITATIONS = (
+    "Floci is a local AWS emulator, not a production object store",
+    "configured emulator controls require planted-negative outcome verification",
+    "managed KMS/HSM, multi-host metadata, backup/restore, and L4 controls remain unproven",
+)
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -304,10 +309,6 @@ def verify_floci_evidence(
         "verifier_pid": process_id,
         "process_separation": "verified",
         "local_digest_negative": local_digest_negative,
-        "limitations": [
-            "Floci is a local AWS emulator, not a production object store",
-            "configured emulator controls require planted-negative outcome verification",
-            "managed KMS/HSM, multi-host metadata, backup/restore, and L4 controls remain unproven",
-        ],
+        "limitations": list(VERIFICATION_LIMITATIONS),
         "verified_at": verification_time.isoformat(),
     }

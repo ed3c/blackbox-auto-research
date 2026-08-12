@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -18,10 +21,13 @@ sys.path.insert(0, str(ROOT))
 from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
     EVIDENCE_SCHEMA,
     VERIFICATION_SCHEMA,
+    VERIFICATION_LIMITATIONS,
     FlociEnvironment,
 )
 from scripts.run_floci_evidence_store_sandbox import (  # noqa: E402
+    BASE_VERIFIED_SCOPE,
     RUN_SCHEMA,
+    RUN_LIMITATIONS,
     _canonical,
     _digest_bytes,
     _digest_files,
@@ -57,9 +63,32 @@ def _parse_object(payload: bytes, name: str) -> dict[str, Any]:
     return value
 
 
+def _read_regular_file(path: Path, name: str) -> bytes:
+    absolute = path.absolute()
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for index, component in enumerate(absolute.parts[1:]):
+            is_last = index == len(absolute.parts[1:]) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if not is_last:
+                flags |= os.O_DIRECTORY
+            try:
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+            except OSError as error:
+                raise ValueError(f"cannot read {name} without symlink traversal: {error}") from error
+            os.close(directory_fd)
+            directory_fd = next_fd
+        _require(stat.S_ISREG(os.fstat(directory_fd).st_mode), f"{name} must be a regular file")
+        chunks = []
+        while chunk := os.read(directory_fd, 65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(directory_fd)
+
+
 def _load_object(path: Path, name: str) -> dict[str, Any]:
-    _require(path.is_file() and not path.is_symlink(), f"{name} must be a regular file")
-    return _parse_object(path.read_bytes(), name)
+    return _parse_object(_read_regular_file(path, name), name)
 
 
 def _load_artifact(
@@ -74,9 +103,7 @@ def _load_artifact(
         f"{name} digest is malformed",
     )
     _require(type(size) is int and size >= 0, f"{name} size is malformed")
-    path = root / expected_locator
-    _require(path.is_file() and not path.is_symlink(), f"{name} must be a regular file")
-    payload = path.read_bytes()
+    payload = _read_regular_file(root / expected_locator, name)
     _require(len(payload) == size, f"{name} size mismatch")
     _require(_digest_bytes(payload) == digest, f"{name} digest mismatch")
     return _parse_object(payload, name), payload
@@ -95,14 +122,29 @@ def _parse_timestamp(value: object, name: str) -> datetime:
     return parsed
 
 
-def _replay_probe(record: object, operation: str, expected_errors: set[str]) -> str:
+def _replay_probe(
+    record: object,
+    operation: str,
+    expected_errors: set[str],
+    expected_argv: list[str],
+) -> tuple[str, str]:
     _require(isinstance(record, dict), f"{operation} probe must be an object")
     _require_keys(
         record,
-        {"operation", "returncode", "stdout", "stderr", "outcome"},
+        {
+            "operation", "argv", "principal_access_key_sha256", "returncode",
+            "stdout", "stderr", "outcome",
+        },
         f"{operation} probe",
     )
     _require(record["operation"] == operation, f"{operation} name mismatch")
+    _require(record["argv"] == expected_argv, f"{operation} probe argv mismatch")
+    principal_digest = record["principal_access_key_sha256"]
+    _require(
+        isinstance(principal_digest, str)
+        and _DIGEST_RE.fullmatch(principal_digest) is not None,
+        f"{operation} principal digest is malformed",
+    )
     _require(type(record["returncode"]) is int, f"{operation} returncode is invalid")
     _require(isinstance(record["stdout"], str), f"{operation} stdout is invalid")
     _require(isinstance(record["stderr"], str), f"{operation} stderr is invalid")
@@ -116,7 +158,7 @@ def _replay_probe(record: object, operation: str, expected_errors: set[str]) -> 
         expected_errors,
     )
     _require(outcome == replayed.__dict__, f"{operation} outcome replay mismatch")
-    return replayed.status
+    return replayed.status, principal_digest
 
 
 def _verify_common_claims(value: Mapping[str, object], name: str) -> None:
@@ -126,6 +168,28 @@ def _verify_common_claims(value: Mapping[str, object], name: str) -> None:
         value["production_claim_allowed"] is False,
         f"{name} production claim must remain disabled",
     )
+
+
+def _probe_argv(
+    record: object, action: str, bucket: str, key: str
+) -> list[str]:
+    _require(isinstance(record, dict), f"{action} probe must be an object")
+    argv = record.get("argv")
+    _require(isinstance(argv, list) and len(argv) >= 3, f"{action} probe argv is invalid")
+    endpoint = argv[2]
+    _require(isinstance(endpoint, str), f"{action} endpoint is invalid")
+    parsed = urlparse(endpoint)
+    _require(
+        parsed.scheme == "https"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and parsed.port is not None
+        and parsed.path == "",
+        f"{action} endpoint is outside the loopback sandbox",
+    )
+    return [
+        "aws", "--endpoint-url", endpoint, "--ca-bundle", "$RUN_CA_BUNDLE",
+        "s3api", action, "--bucket", bucket, "--key", key,
+    ]
 
 
 def _verify_provenance(
@@ -215,6 +279,7 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
     )
     _require(receipt["schema"] == RUN_SCHEMA, "runner schema mismatch")
     _verify_common_claims(receipt, "runner receipt")
+    _require(receipt["limitations"] == list(RUN_LIMITATIONS), "limitations mismatch")
 
     records = receipt["evidence_artifacts"]
     _require(isinstance(records, dict), "evidence artifacts must be an object")
@@ -253,6 +318,10 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
     )
     _require(verification["schema"] == VERIFICATION_SCHEMA, "verifier schema mismatch")
     _verify_common_claims(verification, "verifier receipt")
+    _require(
+        verification["limitations"] == list(VERIFICATION_LIMITATIONS),
+        "verification limitations mismatch",
+    )
 
     run_id = receipt["run_id"]
     run = manifest["run"]
@@ -308,16 +377,28 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
         "container absence was not explicit",
     )
 
-    iam_status = _replay_probe(
-        receipt["iam_delete_probe"],
+    environment_value = manifest["environment"]
+    _require(isinstance(environment_value, dict), "environment must be an object")
+    commit = environment_value.get("commit")
+    _require(isinstance(commit, str), "environment commit is invalid")
+    bucket = f"evidence-{commit[:12]}"
+    artifact_hex = str(artifact["digest"]).removeprefix("sha256:")
+    key = f"artifacts/{artifact_hex[:2]}/{artifact_hex[2:]}"
+    iam_record = receipt["iam_delete_probe"]
+    signature_record = receipt["invalid_signature_probe"]
+    iam_status, iam_principal = _replay_probe(
+        iam_record,
         "s3-delete-object",
         {"AccessDenied", "AccessDeniedException"},
+        _probe_argv(iam_record, "delete-object", bucket, key),
     )
-    signature_status = _replay_probe(
-        receipt["invalid_signature_probe"],
+    signature_status, signature_principal = _replay_probe(
+        signature_record,
         "s3-head-object-with-wrong-secret",
         {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
+        _probe_argv(signature_record, "head-object", bucket, key),
     )
+    _require(iam_principal == signature_principal, "probe principal identity mismatch")
     _require(receipt["iam_delete_denied"] == (iam_status == "denied"), "IAM probe mismatch")
     _require(receipt["invalid_signature_denied"] == (signature_status == "denied"), "signature probe mismatch")
     _require(receipt["sigv4_wrong_secret"] == signature_status, "wrong-secret summary mismatch")
@@ -325,6 +406,10 @@ def verify_bundle(receipt_path: Path) -> dict[str, object]:
     decision = "verified" if security == "pass" else "quarantine"
     _require(receipt["security_decision"] == security, "security decision mismatch")
     _require(receipt["decision"] == decision, "runner decision mismatch")
+    expected_scope = list(BASE_VERIFIED_SCOPE)
+    if iam_status == "denied":
+        expected_scope.append("IAM delete deny")
+    _require(receipt["verified_scope"] == expected_scope, "verified_scope mismatch")
     return {
         "schema": RUN_SCHEMA,
         "decision": decision,

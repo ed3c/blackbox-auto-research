@@ -31,6 +31,15 @@ from blackbox_autoresearch.floci_evidence_store import (  # noqa: E402
 
 
 RUN_SCHEMA = "blackbox-floci-sandbox-run/v2"
+BASE_VERIFIED_SCOPE = (
+    "S3 content-addressed round-trip",
+    "WAL restart",
+    "fresh-process retrieval",
+)
+RUN_LIMITATIONS = (
+    "external production object storage remains unproven",
+    "production metadata/index, managed KMS/HSM, backup/restore, and multi-host recovery remain unproven",
+)
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _AWS_ERROR_RE = re.compile(r"An error occurred \(([^)]+)\)")
 _T = TypeVar("_T")
@@ -288,9 +297,15 @@ def _probe_receipt(
     operation: str,
     result: subprocess.CompletedProcess[str],
     outcome: AwsProbeOutcome,
+    access_key_id: str,
 ) -> dict[str, object]:
+    argv = list(result.args)
+    ca_index = argv.index("--ca-bundle") + 1
+    argv[ca_index] = "$RUN_CA_BUNDLE"
     return {
         "operation": operation,
+        "argv": argv,
+        "principal_access_key_sha256": _digest_bytes(access_key_id.encode()),
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -533,7 +548,12 @@ def _execute(
                 check=False,
             )
             iam_probe = _evaluate_aws_probe(denied, {"AccessDenied", "AccessDeniedException"})
-            iam_probe_receipt = _probe_receipt("s3-delete-object", denied, iam_probe)
+            iam_probe_receipt = _probe_receipt(
+                "s3-delete-object",
+                denied,
+                iam_probe,
+                credentials["AWS_ACCESS_KEY_ID"],
+            )
             iam_delete_denied = iam_probe.status == "denied"
             wrong_credentials = {
                 "AWS_ACCESS_KEY_ID": credentials["AWS_ACCESS_KEY_ID"],
@@ -556,7 +576,10 @@ def _execute(
                 {"SignatureDoesNotMatch", "InvalidSignature", "InvalidSignatureException"},
             )
             signature_probe_receipt = _probe_receipt(
-                "s3-head-object-with-wrong-secret", bad_signature, signature_probe
+                "s3-head-object-with-wrong-secret",
+                bad_signature,
+                signature_probe,
+                credentials["AWS_ACCESS_KEY_ID"],
             )
             invalid_signature_denied = signature_probe.status == "denied"
             evidence_artifacts = _export_evidence_bundle(
@@ -586,7 +609,7 @@ def _execute(
         raise RuntimeError("Floci sandbox did not produce verified evidence and teardown")
     finished_at = datetime.now(timezone.utc).isoformat()
     security_decision = _security_decision(iam_probe, signature_probe)
-    verified_scope = ["S3 content-addressed round-trip", "WAL restart", "fresh-process retrieval"]
+    verified_scope = list(BASE_VERIFIED_SCOPE)
     if iam_delete_denied:
         verified_scope.append("IAM delete deny")
     receipt = {
@@ -615,10 +638,7 @@ def _execute(
         "teardown": teardown.__dict__,
         "verification": verification,
         "evidence_artifacts": evidence_artifacts,
-        "limitations": [
-            "external production object storage remains unproven",
-            "production metadata/index, managed KMS/HSM, backup/restore, and multi-host recovery remain unproven",
-        ],
+        "limitations": list(RUN_LIMITATIONS),
         **_reproduction_metadata(commit, args.run_id),
     }
     _write_json(receipt_path, receipt)
