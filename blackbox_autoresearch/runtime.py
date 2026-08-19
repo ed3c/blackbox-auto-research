@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from typing import Any, Protocol
+
+from ._content_addressing import canonical_json_bytes, sha256_digest
 
 
 class EnvironmentAdapter(Protocol):
@@ -58,8 +58,7 @@ class DeterministicCounterEnvironment:
         return dict(self.observe())
 
     def state_digest(self) -> str:
-        raw = json.dumps(self.snapshot(), sort_keys=True, separators=(",", ":")).encode()
-        return "sha256:" + hashlib.sha256(raw).hexdigest()
+        return sha256_digest(canonical_json_bytes(self.snapshot()))
 
     def teardown(self) -> None:
         self._closed = True
