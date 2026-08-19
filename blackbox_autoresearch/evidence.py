@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from typing import Any
+
+from ._content_addressing import canonical_json_bytes, sha256_digest
 
 
 @dataclass(frozen=True)
@@ -24,12 +24,10 @@ class EvidenceChain:
 
     @staticmethod
     def _digest(sequence: int, previous_hash: str, payload: dict[str, Any]) -> str:
-        canonical = json.dumps(
-            {"sequence": sequence, "previous_hash": previous_hash, "payload": payload},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+        canonical = canonical_json_bytes(
+            {"sequence": sequence, "previous_hash": previous_hash, "payload": payload}
+        )
+        return sha256_digest(canonical)
 
     def append(self, payload: dict[str, Any]) -> EvidenceEvent:
         sequence = len(self._events)
