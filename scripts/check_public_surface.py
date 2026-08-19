@@ -13,6 +13,10 @@ from urllib.parse import unquote, urlsplit
 REQUIRED_FILES = ("README.md", "AGENTS.md", "SECURITY.md", "LICENSE")
 IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
 BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf"}
+APACHE_2_LICENSE_MARKERS = (
+    "Apache License",
+    "Version 2.0, January 2004",
+)
 FORBIDDEN_LITERALS = (
     "ix-" + "agy",
     "ix" + "security",
@@ -48,10 +52,10 @@ def check(root: Path) -> list[str]:
         if path.is_symlink() or not path.is_file():
             failures.append(f"required regular file missing: {name}")
     license_path = root / "LICENSE"
-    if license_path.is_file() and "MIT License" not in license_path.read_text(
-        encoding="utf-8", errors="replace"
-    ):
-        failures.append("LICENSE is not recognized as MIT")
+    if license_path.is_file():
+        license_text = license_path.read_text(encoding="utf-8", errors="replace")
+        if not all(marker in license_text for marker in APACHE_2_LICENSE_MARKERS):
+            failures.append("LICENSE is not recognized as Apache-2.0")
 
     for path in _iter_paths(root):
         rel = path.relative_to(root).as_posix()
